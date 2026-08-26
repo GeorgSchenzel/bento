@@ -7,6 +7,7 @@ use clap::{Parser, Subcommand};
 use microsandbox::image::Image;
 use microsandbox::sandbox::Sandbox;
 use microsandbox::setup;
+use microsandbox::Volume;
 use microsandbox::MicrosandboxError;
 use serde_yaml::Value;
 
@@ -83,8 +84,8 @@ enum Command {
     Enter,
     #[command(about = "Run opencode in the box for this repo")]
     Agent,
-    #[command(about = "Remove the box for this repo (stops it first)")]
-    Rm,
+    #[command(about = "Remove the box and its opencode volume for this repo")]
+    Clean,
 }
 
 struct Repo {
@@ -103,7 +104,7 @@ async fn main() -> ExitCode {
         Command::Stop => stop().await,
         Command::Enter => enter().await,
         Command::Agent => agent().await,
-        Command::Rm => rm().await,
+        Command::Clean => clean().await,
     }
 }
 
@@ -486,17 +487,30 @@ async fn agent() -> ExitCode {
     }
 }
 
-async fn rm() -> ExitCode {
+async fn clean() -> ExitCode {
     let repo = match discover() {
         Ok(repo) => repo,
         Err(err) => return fail(&err),
     };
+    let code = rm_sandbox(&repo).await;
+    if code != ExitCode::SUCCESS {
+        return code;
+    }
+    let volume = format!("{}-opencode", repo.name);
+    match Volume::remove(&volume).await {
+        Ok(()) => {
+            println!("volume '{volume}': removed");
+            ExitCode::SUCCESS
+        }
+        Err(MicrosandboxError::VolumeNotFound(_)) => ExitCode::SUCCESS,
+        Err(err) => report(&err, &repo.name),
+    }
+}
+
+async fn rm_sandbox(repo: &Repo) -> ExitCode {
     let handle = match Sandbox::get(&repo.name).await {
         Ok(handle) => handle,
-        Err(MicrosandboxError::SandboxNotFound(_)) => {
-            println!("sandbox '{}': not found", repo.name);
-            return ExitCode::SUCCESS;
-        }
+        Err(MicrosandboxError::SandboxNotFound(_)) => return ExitCode::SUCCESS,
         Err(err) => return report(&err, &repo.name),
     };
     if let Err(err) = handle.stop().await {
