@@ -11,7 +11,6 @@
     curl
     cacert
     procps
-    opencode
     zellij
     just
   ];

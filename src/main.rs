@@ -11,6 +11,7 @@ use microsandbox::MicrosandboxError;
 use serde_yaml::Value;
 
 const INIT: &str = "/env/init-vibe";
+const GUEST_HOME: &str = "/env";
 
 const DEFAULT_YAML: &str = "\
 inputs:
@@ -28,6 +29,9 @@ inputs:
 const BOX_NIX: &str = r#"{ pkgs, lib, config, ... }:
 
 {
+  # bento-added tooling: the coding agent available in every box.
+  packages = [ pkgs.opencode ];
+
   # PID 1 in the box is procfileScript via the init shim; with no services
   # devenv-tasks exits at once and takes the VM down. keepalive holds the
   # box open (also required for evaluation: CLI 2.0 nulls task.package
@@ -76,6 +80,8 @@ enum Command {
     Stop,
     #[command(about = "Open an interactive shell in the box for this repo")]
     Enter,
+    #[command(about = "Run opencode in the box for this repo")]
+    Agent,
     #[command(about = "Remove the box for this repo (stops it first)")]
     Rm,
 }
@@ -95,6 +101,7 @@ async fn main() -> ExitCode {
         Command::Start => start().await,
         Command::Stop => stop().await,
         Command::Enter => enter().await,
+        Command::Agent => agent().await,
         Command::Rm => rm().await,
     }
 }
@@ -280,16 +287,91 @@ async fn ensure_image(repo: &Repo) -> Option<ExitCode> {
     }
 }
 
+/// Host terminal identity for attach sessions. The SDK does not propagate
+/// TERM itself; TUIs (opencode) and colored shell output need it.
+fn term_env() -> Vec<(String, String)> {
+    let mut env = vec![(
+        "TERM".to_string(),
+        std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+    )];
+    if let Ok(colorterm) = std::env::var("COLORTERM") {
+        env.push(("COLORTERM".to_string(), colorterm));
+    }
+    env
+}
+
+fn home_file(rel: &str) -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    let path = PathBuf::from(home).join(rel);
+    match fs::canonicalize(&path) {
+        // Resolve symlinks (sops-rendered secrets, dotfile managers) so the
+        // host-side bind serves the real file.
+        Ok(canonical) => Some(canonical),
+        Err(_) => {
+            eprintln!("warning: ~/{rel} not found, skipping its mount");
+            None
+        }
+    }
+}
+
 async fn create_sandbox(repo: &Repo) -> Result<Sandbox, MicrosandboxError> {
-    Sandbox::builder(repo.name.clone())
+    let opencode_state = format!("{GUEST_HOME}/.local/share/opencode");
+    let mut builder = Sandbox::builder(repo.name.clone())
         .image(repo.tag.clone())
         .init(INIT)
         .user("0:0")
         .shell("/bin/bash")
+        .cpus(4)
+        .memory(8192)
+        .workdir(GUEST_HOME)
         .detached(true)
         .replace()
-        .create_detached()
-        .await
+        .volume(opencode_state.clone(), |m| {
+            m.named_with(format!("{}-opencode", repo.name), |v| v.ensure_exists())
+        });
+    if let Some(auth) = home_file(".local/share/opencode/auth.json") {
+        // Nested ro file bind over the volume: the token stays on the host
+        // and never lands in the volume or the image.
+        builder = builder.volume(format!("{opencode_state}/auth.json"), |m| {
+            m.bind(auth).readonly()
+        });
+    }
+    if let Some(config) = home_file(".config/opencode/opencode.json") {
+        builder = builder.volume(format!("{GUEST_HOME}/.config/opencode/opencode.json"), |m| {
+            m.bind(config).readonly()
+        });
+    }
+    builder.create_detached().await
+}
+
+/// Resolve the repo's box to a connected running sandbox, creating or
+/// starting it as needed. Prints diagnostics; Err carries the exit code.
+async fn ensure_running(repo: &Repo) -> Result<Sandbox, ExitCode> {
+    let handle = match Sandbox::get(&repo.name).await {
+        Ok(handle) => handle,
+        Err(MicrosandboxError::SandboxNotFound(_)) => {
+            println!("sandbox '{}': not found, creating...", repo.name);
+            if let Some(code) = ensure_image(repo).await {
+                return Err(code);
+            }
+            match create_sandbox(repo).await {
+                Ok(_) => match Sandbox::get(&repo.name).await {
+                    Ok(handle) => handle,
+                    Err(err) => return Err(report(&err, &repo.name)),
+                },
+                Err(err) => return Err(report(&err, &repo.name)),
+            }
+        }
+        Err(err) => return Err(report(&err, &repo.name)),
+    };
+    match handle.connect().await {
+        Ok(sb) => Ok(sb),
+        Err(MicrosandboxError::SandboxNotRunning(_)) => {
+            println!("sandbox '{}': not running, starting...", repo.name);
+            handle.start_detached().await.map_err(|err| report(&err, &repo.name))
+        }
+        Err(err) => Err(report(&err, &repo.name)),
+    }
 }
 
 async fn build_cmd() -> ExitCode {
@@ -353,36 +435,46 @@ async fn enter() -> ExitCode {
         Ok(repo) => repo,
         Err(err) => return fail(&err),
     };
-    let handle = match Sandbox::get(&repo.name).await {
-        Ok(handle) => handle,
-        Err(MicrosandboxError::SandboxNotFound(_)) => {
-            println!("sandbox '{}': not found, creating...", repo.name);
-            if let Some(code) = ensure_image(&repo).await {
-                return code;
-            }
-            match create_sandbox(&repo).await {
-                Ok(_) => match Sandbox::get(&repo.name).await {
-                    Ok(handle) => handle,
-                    Err(err) => return report(&err, &repo.name),
-                },
-                Err(err) => return report(&err, &repo.name),
-            }
-        }
-        Err(err) => return report(&err, &repo.name),
-    };
-    let sb = match handle.connect().await {
+    let sb = match ensure_running(&repo).await {
         Ok(sb) => sb,
-        Err(MicrosandboxError::SandboxNotRunning(_)) => {
-            println!("sandbox '{}': not running, starting...", repo.name);
-            match handle.start_detached().await {
-                Ok(sb) => sb,
-                Err(err) => return report(&err, &repo.name),
-            }
-        }
-        Err(err) => return report(&err, &repo.name),
+        Err(code) => return code,
     };
     println!("entering sandbox '{}' (detach with Ctrl-])", repo.name);
-    match sb.attach_shell().await {
+    match sb
+        .attach_with("/bin/bash", |a| {
+            a.cwd(GUEST_HOME).envs(term_env())
+        })
+        .await
+    {
+        Ok(code) if code < 0 => ExitCode::SUCCESS,
+        Ok(code) => ExitCode::from(code as u8),
+        Err(err) => report(&err, &repo.name),
+    }
+}
+
+async fn agent() -> ExitCode {
+    if !std::io::stdin().is_terminal() {
+        eprintln!("error: stdin is not a terminal; `bento agent` needs an interactive terminal");
+        return ExitCode::FAILURE;
+    }
+    if let Some(code) = ensure_runtime() {
+        return code;
+    }
+    let repo = match discover() {
+        Ok(repo) => repo,
+        Err(err) => return fail(&err),
+    };
+    let sb = match ensure_running(&repo).await {
+        Ok(sb) => sb,
+        Err(code) => return code,
+    };
+    println!("starting opencode in sandbox '{}' (detach with Ctrl-])", repo.name);
+    match sb
+        .attach_with("opencode", |a| {
+            a.cwd(GUEST_HOME).envs(term_env())
+        })
+        .await
+    {
         Ok(code) if code < 0 => ExitCode::SUCCESS,
         Ok(code) => ExitCode::from(code as u8),
         Err(err) => report(&err, &repo.name),
