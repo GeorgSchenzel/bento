@@ -12,6 +12,7 @@ use serde_yaml::Value;
 
 const INIT: &str = "/env/init-vibe";
 const GUEST_HOME: &str = "/env";
+const WORKDIR: &str = "/workspace";
 
 const DEFAULT_YAML: &str = "\
 inputs:
@@ -316,6 +317,9 @@ fn home_file(rel: &str) -> Option<PathBuf> {
 
 async fn create_sandbox(repo: &Repo) -> Result<Sandbox, MicrosandboxError> {
     let opencode_state = format!("{GUEST_HOME}/.local/share/opencode");
+    // Canonicalize so symlinked paths (managed dotdirs, /tmp on macOS) bind
+    // the real host target.
+    let project = fs::canonicalize(&repo.dir).unwrap_or_else(|_| repo.dir.clone());
     let mut builder = Sandbox::builder(repo.name.clone())
         .image(repo.tag.clone())
         .init(INIT)
@@ -323,9 +327,10 @@ async fn create_sandbox(repo: &Repo) -> Result<Sandbox, MicrosandboxError> {
         .shell("/bin/bash")
         .cpus(4)
         .memory(8192)
-        .workdir(GUEST_HOME)
+        .workdir(WORKDIR)
         .detached(true)
         .replace()
+        .volume(WORKDIR, |m| m.bind(project))
         .volume(opencode_state.clone(), |m| {
             m.named_with(format!("{}-opencode", repo.name), |v| v.ensure_exists())
         });
@@ -442,7 +447,7 @@ async fn enter() -> ExitCode {
     println!("entering sandbox '{}' (detach with Ctrl-])", repo.name);
     match sb
         .attach_with("/bin/bash", |a| {
-            a.cwd(GUEST_HOME).envs(term_env())
+            a.cwd(WORKDIR).envs(term_env())
         })
         .await
     {
@@ -471,7 +476,7 @@ async fn agent() -> ExitCode {
     println!("starting opencode in sandbox '{}' (detach with Ctrl-])", repo.name);
     match sb
         .attach_with("opencode", |a| {
-            a.cwd(GUEST_HOME).envs(term_env())
+            a.cwd(WORKDIR).envs(term_env())
         })
         .await
     {
