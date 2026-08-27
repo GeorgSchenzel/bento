@@ -1,0 +1,6 @@
+# bento box config. `overlay` lists repo dirs the box shadows with its own
+# (linux) copies under .bento/ov/ — platform-specific build artifacts that
+# must not mix between the host and the box.
+# Note: add .bento/ to your .gitignore.
+overlay:
+  - target

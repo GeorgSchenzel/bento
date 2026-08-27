@@ -104,6 +104,80 @@ struct Repo {
     name: String,
     tag: String,
     wt: Option<WorktreeGit>,
+    /// Repo-relative dirs shadowed with box-local copies (bento.yaml).
+    overlays: Vec<String>,
+}
+
+/// Repo-root `bento.yaml`. Unknown keys are rejected so typos fail loudly.
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Config {
+    #[serde(default)]
+    overlay: Vec<String>,
+}
+
+/// Host-side backing tree for overlays: `<project>/.bento/ov/<path>`.
+fn overlay_root(project: &Path) -> PathBuf {
+    project.join(".bento/ov")
+}
+
+fn overlays_label(overlays: &[String]) -> String {
+    overlays.join(",")
+}
+
+fn load_overlays(dir: &Path) -> anyhow::Result<Vec<String>> {
+    let path = dir.join("bento.yaml");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let text =
+        fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let cfg: Config =
+        serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+    validate_overlays(&cfg.overlay, &path)?;
+    Ok(cfg.overlay)
+}
+
+fn validate_overlays(entries: &[String], path: &Path) -> anyhow::Result<()> {
+    let mut sorted: Vec<&str> = entries.iter().map(|s| s.as_str()).collect();
+    for entry in entries {
+        if entry.trim() != *entry
+            || entry.is_empty()
+            || entry.chars().any(|c| c.is_whitespace() || c == ',')
+        {
+            bail!("{}: bad overlay entry '{entry}'", path.display());
+        }
+        let rel = Path::new(entry);
+        if rel.is_absolute() {
+            bail!("{}: overlay '{entry}' must be relative", path.display());
+        }
+        for comp in rel.components() {
+            if !matches!(comp, std::path::Component::Normal(_)) {
+                bail!(
+                    "{}: overlay '{entry}' must be a plain relative path (no .. or .)",
+                    path.display()
+                );
+            }
+        }
+        if rel == Path::new(".bento") || entry.starts_with(".bento/") {
+            bail!("{}: overlay '{entry}' may not live under .bento", path.display());
+        }
+    }
+    sorted.sort_unstable();
+    for w in sorted.windows(2) {
+        if w[0] == w[1] {
+            bail!("{}: duplicate overlay '{}'", path.display(), w[0]);
+        }
+        if w[1].starts_with(&format!("{}/", w[0])) {
+            bail!(
+                "{}: overlay '{}' overlaps '{}'",
+                path.display(),
+                w[1],
+                w[0]
+            );
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -160,7 +234,7 @@ fn discover() -> anyhow::Result<Repo> {
     let mut dir = std::env::current_dir().context("cannot determine working directory")?;
     loop {
         if dir.join("devenv.nix").is_file() || dir.join("devenv.yaml").is_file() {
-            return Ok(repo_at(dir));
+            return repo_at(dir);
         }
         if !dir.pop() {
             bail!("no devenv.nix or devenv.yaml found in this directory or any parent");
@@ -172,7 +246,7 @@ fn discover() -> anyhow::Result<Repo> {
 /// (`bento_{project}` for the main one, `bento_{project}_{dir}` for
 /// worktrees); the image is shared per project. Everything is collision-safe
 /// via the bento.path label guard in [create_sandbox], not via hashes.
-fn repo_at(dir: PathBuf) -> Repo {
+fn repo_at(dir: PathBuf) -> anyhow::Result<Repo> {
     let wt = detect_worktree(&dir);
     let project = git(&dir, &["config", "--get", "remote.origin.url"])
         .map(|url| remote_project(&url))
@@ -187,12 +261,14 @@ fn repo_at(dir: PathBuf) -> Repo {
     // alphanumeric start (always satisfied by the "bento_" prefix).
     let name = truncate(&checkout, 128).to_string();
     let image = truncate(&format!("bento_{project}"), 128).to_string();
-    Repo {
+    let overlays = load_overlays(&dir)?;
+    Ok(Repo {
         tag: format!("{image}:latest"),
         name,
         dir,
         wt,
-    }
+        overlays,
+    })
 }
 
 fn dir_basename(dir: &Path) -> String {
@@ -480,9 +556,26 @@ async fn create_sandbox(repo: &Repo) -> anyhow::Result<Sandbox> {
         .volume(format!("{GUEST_HOME}/.gitconfig"), |m| {
             m.bind(&gitconfig).readonly()
         })
+        .volume(format!("{GUEST_HOME}/.git-exclude"), |m| {
+            m.bind(state.join("git-exclude")).readonly()
+        })
         .volume(opencode_state.clone(), |m| {
             m.named_with(format!("{}-opencode", repo.name), |v| v.ensure_exists())
         });
+    // Box-local copies of platform-specific dirs: the guest bind of the
+    // checkout is shadowed per entry by its .bento/ov twin, so host (macOS)
+    // artifacts and box (linux) artifacts never mix.
+    let overlay_base = overlay_root(&project);
+    for entry in &repo.overlays {
+        let host = overlay_base.join(entry);
+        fs::create_dir_all(&host)
+            .with_context(|| format!("creating {}", host.display()))?;
+        println!("overlay '{entry}': {WORKDIR}/{entry} -> {}", host.display());
+        builder = builder.volume(format!("{WORKDIR}/{entry}"), |m| m.bind(&host));
+    }
+    if !repo.overlays.is_empty() {
+        builder = builder.label("bento.overlays", overlays_label(&repo.overlays));
+    }
     if let Some(wt) = &repo.wt {
         let (pointer, back) = write_worktree_pointers(wt, &state)?;
         // The main checkout's git DB, mounted rw: in-box commits write
@@ -517,14 +610,17 @@ async fn create_sandbox(repo: &Repo) -> anyhow::Result<Sandbox> {
 }
 
 /// Minimal in-box git identity: user from host config, no signing (host
-/// signing keys/helpers are unavailable in the box), and safe.directory for
-/// the bind-mounted worktree and git dir.
+/// signing keys/helpers are unavailable in the box), safe.directory for the
+/// bind-mounted worktree and git dir, and an excludes file hiding .bento/
+/// (the host-side overlay backing tree) from the in-box agent. Host git
+/// state is never touched — whether to gitignore .bento/ is the user's call.
 fn write_gitconfig(repo: &Repo, state: &Path) -> anyhow::Result<PathBuf> {
     let (name, email) = git_identity(&repo.dir)?;
     let mut text = format!(
         "[user]\n\tname = {name}\n\temail = {email}\n\
          [commit]\n\tgpgsign = false\n\
          [tag]\n\tgpgsign = false\n\
+         [core]\n\texcludesFile = {GUEST_HOME}/.git-exclude\n\
          [safe]\n\tdirectory = {WORKDIR}\n\tdirectory = {GUEST_GIT}\n"
     );
     // git also checks the resolved gitdir for dubious ownership
@@ -533,6 +629,9 @@ fn write_gitconfig(repo: &Repo, state: &Path) -> anyhow::Result<PathBuf> {
     }
     let path = state.join("gitconfig");
     fs::write(&path, text).with_context(|| format!("writing {}", path.display()))?;
+    let exclude = state.join("git-exclude");
+    fs::write(&exclude, ".bento/\n")
+        .with_context(|| format!("writing {}", exclude.display()))?;
     Ok(path)
 }
 
@@ -569,6 +668,20 @@ async fn ensure_running(repo: &Repo) -> Result<Sandbox, ExitCode> {
         }
         Err(err) => return Err(report(&err, &repo.name)),
     };
+    // Mounts are fixed at create; a stale sandbox with a different overlay
+    // config keeps its old mounts until `bento start` replaces it.
+    if let Some(existing) = handle
+        .config()
+        .ok()
+        .and_then(|c| c.spec.labels.get("bento.overlays").cloned())
+    {
+        let want = overlays_label(&repo.overlays);
+        if existing != want {
+            println!(
+                "warning: overlay config changed ({existing} -> {want}); run `bento start` to apply"
+            );
+        }
+    }
     match handle.connect().await {
         Ok(sb) => Ok(sb),
         Err(MicrosandboxError::SandboxNotRunning(_)) => {
@@ -715,6 +828,17 @@ async fn clean() -> ExitCode {
                 eprintln!("error: removing {}: {e}", state.display());
                 return ExitCode::FAILURE;
             }
+        }
+    }
+    // Box-side overlay backing tree (linux build artifacts).
+    let project = fs::canonicalize(&repo.dir).unwrap_or_else(|_| repo.dir.clone());
+    let bento_dir = project.join(".bento");
+    match fs::remove_dir_all(&bento_dir) {
+        Ok(()) => println!("overlay tree '{}': removed", bento_dir.display()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            eprintln!("error: removing {}: {e}", bento_dir.display());
+            return ExitCode::FAILURE;
         }
     }
     ExitCode::SUCCESS
