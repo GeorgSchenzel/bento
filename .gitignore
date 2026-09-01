@@ -21,3 +21,6 @@ result
 .config/
 .local/
 .npm/
+
+# bento box overlays (linux build artifacts)
+.bento/
