@@ -5,7 +5,9 @@ Run any repo's devenv inside a [microsandbox](https://microsandbox.dev) box.
 ## Install (Nix)
 
 The flake exposes `packages`, `overlays.default`, `nixosModules.bento` and
-`homeManagerModules.bento` for `x86_64-linux` and `aarch64-linux`.
+`homeManagerModules.bento` for `x86_64-linux`, `aarch64-linux`, and
+`aarch64-darwin`. macOS requires Apple Silicon (a microsandbox runtime
+requirement); the Home Manager module also works under nix-darwin.
 
 ### Home Manager (recommended)
 
