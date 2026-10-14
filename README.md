@@ -80,6 +80,13 @@ Plugins that call host-only binaries won't work in the box.
   chmod 600 ~/.config/bento/claude-token
   ```
 
+### devenv
+
+If the checkout has a `devenv.nix`, `enter`, `claude` and `opencode` run
+inside its `devenv shell`, and `.devenv` is overlaid like `target` (see
+below). The first activation builds the shell through the builder and can
+take minutes; after that it's cached in the shared store.
+
 ### bento.yaml
 
 Optional, at the checkout root:

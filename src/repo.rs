@@ -76,7 +76,11 @@ fn repo_at(dir: PathBuf) -> Result<Repo> {
     } else {
         format!("bento_{project}")
     };
-    let cfg = load_config(&dir)?;
+    let mut cfg = load_config(&dir)?;
+    // devenv's state holds platform-specific profile symlinks
+    if dir.join("devenv.nix").is_file() && !cfg.overlay.iter().any(|o| o == ".devenv") {
+        cfg.overlay.push(".devenv".into());
+    }
     Ok(Repo {
         // msb caps sandbox names at 128 bytes
         name: truncate(&name, 128).to_string(),

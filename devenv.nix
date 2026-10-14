@@ -1,4 +1,4 @@
-{ pkgs, config, ... }:
+{ pkgs, ... }:
 
 {
   packages = with pkgs; [
@@ -29,6 +29,5 @@
     };
   };
 
-  env.PATH = "${config.devenv.profile}/bin:/bin:/usr/bin";
   env.SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
 }

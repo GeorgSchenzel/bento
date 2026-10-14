@@ -28,6 +28,7 @@
             paths = with pkgs; [
               claude-code
               opencode
+              devenv # boxes run in the checkout's devenv shell
               git
               socat
               ncurses # terminfo for the host's TERM

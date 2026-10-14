@@ -90,8 +90,11 @@ pub async fn run_streamed(sb: &Sandbox, what: &str, script: String) -> Result<()
 }
 
 /// Falls back to a generic TERM when the guest has no terminfo for the
-/// host's (e.g. a new terminal emulator), then execs the command.
-const ATTACH_WRAPPER: &str = r#"infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color; exec "$0" "$@""#;
+/// host's (e.g. a new terminal emulator), then execs the command, inside the
+/// checkout's devenv shell when there is one.
+const ATTACH_WRAPPER: &str = r#"infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
+[ -f devenv.nix ] && exec devenv shell -- "$0" "$@"
+exec "$0" "$@""#;
 
 /// Attach an interactive command; returns the process exit code.
 pub async fn attach(
