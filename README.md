@@ -1,15 +1,19 @@
 # bento
 
-Run any repo's devenv inside a [microsandbox](https://microsandbox.dev) box.
+Per-checkout [microsandbox](https://microsandbox.dev) boxes on a shared nix
+store, with claude and opencode inside.
 
-## Install (Nix)
+One **builder** VM per host owns a shared nix store and runs `nix-daemon`.
+Every checkout (or git worktree) gets its own **box**: a plain bash sandbox
+with the checkout at `/workspace`, the store mounted read-only and nix
+talking to the builder's daemon. Anything you `nix shell` or `nix build` in
+one box lands in the shared store and is reused by all the others.
 
-The flake exposes `packages`, `overlays.default`, `nixosModules.bento` and
-`homeManagerModules.bento` for `x86_64-linux`, `aarch64-linux`, and
-`aarch64-darwin`. macOS requires Apple Silicon (a microsandbox runtime
-requirement); the Home Manager module also works under nix-darwin.
+macOS on Apple Silicon only, for now.
 
-### Home Manager (recommended)
+## Install
+
+### Home Manager / nix-darwin
 
 ```nix
 # your flake
@@ -23,45 +27,97 @@ imports = [ inputs.bento.homeManagerModules.bento ];
 programs.bento.enable = true;
 ```
 
-### NixOS
+Ad-hoc: `nix profile install github:YOUR_NAME/bento`.
 
-```nix
-inputs.bento.url = "github:YOUR_NAME/bento";
-```
-
-```nix
-# your NixOS configuration
-imports = [ inputs.bento.nixosModules.bento ];
-
-programs.bento.enable = true;
-```
-
-### Ad-hoc
+### cargo
 
 ```sh
-nix run github:YOUR_NAME/bento -- check
-nix profile install github:YOUR_NAME/bento
+cargo install --locked --path .   # needs rustc >= 1.94
 ```
 
-## Runtime dependencies
+From a clone: `just install` / `just uninstall`.
 
-- `git` — wrapped into the nix package's PATH
-- `devenv` — must be on your PATH; used by `bento build` to build the target
-  repo's container image
-- microsandbox runtime — installed on demand via `bento install`
+Either way, then run `bento install` once. It installs the microsandbox
+runtime (0.7.8, into `~/.microsandbox`), creates the store, and builds the
+box tools. The first run downloads about 1–2 GB. Nix on the host is not
+needed.
 
 ## Usage
 
+Run these from inside a checkout:
+
 ```
-bento check    # is the microsandbox runtime installed?
-bento install  # install the runtime
-bento build    # build the devenv container image for this repo
-bento start    # start the box (builds the image when missing)
-bento stop     # stop the box
-bento enter    # interactive shell in the box
-bento agent    # run opencode in the box
-bento clean    # remove the box and its opencode volume
+bento enter      # bash in this checkout's box (created/started on demand)
+bento claude     # claude in the box (args are passed through)
+bento opencode   # opencode in the box (args are passed through)
+bento start      # (re)create the box, applying config changes
+bento stop       # stop the box (the builder keeps running)
+bento clean      # remove the box, its agent state and .bento/
+bento builder    # bash in the builder VM
 ```
+
+The box is named after the checkout: `bento_<project>` for a main checkout,
+`bento_<project>_<dir>` for a linked worktree. In a worktree box, `git
+commit` works and the commit lands in the host repo.
+
+### Agents
+
+The box sees the host's agent config read-only: `~/.claude/{settings.json,
+CLAUDE.md,skills,plugins,agents,commands}` and everything in
+`~/.config/opencode`. Its HOME has the same path as on the host, so absolute
+paths in that config still resolve. Agent state (history, sessions, the
+opencode db) is kept per box in `~/.local/share/bento/boxes/<box>/`.
+Plugins that call host-only binaries won't work in the box.
+
+- **opencode** uses the host's `~/.local/share/opencode/auth.json`
+  (read-only).
+- **claude** can't use the host login (it lives in the macOS Keychain).
+  Create a long-lived token once and save it:
+
+  ```sh
+  claude setup-token   # on the host
+  mkdir -p ~/.config/bento && pbpaste > ~/.config/bento/claude-token  # after copying the token
+  chmod 600 ~/.config/bento/claude-token
+  ```
+
+### bento.yaml
+
+Optional, at the checkout root:
+
+```yaml
+# Repo dirs the box shadows with its own (linux) copies under .bento/ov/,
+# so host and box build artifacts never mix. Add .bento/ to .gitignore.
+overlay:
+  - target
+# GiB the box may add to each writable mount (default 64).
+quota_gib: 64
+```
+
+## How it works
+
+```
+~/.local/share/bento/
+├── store.sparseimage   case-sensitive APFS, sparse, max 60 GB
+├── store/nix           its mountpoint; /nix for the builder and every box
+└── boxes/<box>/        per-box agent state and generated git config
+
+bento-builder           /nix rw, nix-daemon ← socat TCP, 127.0.0.1:17760
+bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:17760
+                        NIX_REMOTE=unix:///tmp/nix.sock
+```
+
+- The builder is the only process that writes to the store. Locks don't
+  work across microsandbox VMs, so two VMs writing the same store corrupt it.
+- The box tools (claude-code, opencode, git, socat, ncurses) come from a
+  flake that is embedded in the binary (`tools/`). The builder builds it
+  into the GC root `/nix/var/nix/gcroots/bento/tools`, and boxes have its
+  `bin/` on PATH. Changing the flake rebuilds the tools on the next command.
+- Every command checks the builder's health with a nix-daemon handshake.
+  When the check fails, or bento changed, the builder is recreated, never
+  restarted: published ports and background processes don't survive a
+  restart.
+- There is no garbage collection yet; the store only grows (up to the
+  image cap).
 
 ## Development
 
@@ -69,5 +125,6 @@ bento clean    # remove the box and its opencode volume
 nix develop --no-pure-eval   # same environment as `devenv shell`
 ```
 
-`--no-pure-eval` lets devenv detect the project directory; `devenv shell`
-keeps working as before.
+Bumping the `microsandbox` crate means updating the release hashes in
+`flake.nix`. Design notes and their evidence: `docs/handoff-shared-store.md`
+and the `experiments/shared-store` branch.

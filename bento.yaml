@@ -4,3 +4,5 @@
 # Note: add .bento/ to your .gitignore.
 overlay:
   - target
+# quota_gib: GiB the box may add to each writable bind (checkout, overlays,
+# git dir); default 64. Guards the host disk; msb's own default is 4.

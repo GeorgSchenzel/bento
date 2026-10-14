@@ -12,7 +12,6 @@
     cacert
     procps
     zellij
-    just
   ];
 
   languages.rust = {

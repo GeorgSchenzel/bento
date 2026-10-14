@@ -1,5 +1,5 @@
 {
-  description = "bento — run any repo's devenv inside a microsandbox box";
+  description = "bento — per-checkout microsandbox boxes on a shared nix store";
 
   inputs = {
     # Used to build the bento package.
@@ -18,14 +18,6 @@
       url = "github:oxalica/rust-overlay";
       inputs.nixpkgs.follows = "devenv-nixpkgs";
     };
-
-    nix2container = {
-      url = "github:nlewo/nix2container";
-      inputs.nixpkgs.follows = "devenv-nixpkgs";
-    };
-
-    # no nixpkgs follow here: mk-shell-bin declares no nixpkgs input
-    mk-shell-bin.url = "github:rrbutani/nix-mk-shell-bin";
   };
 
   nixConfig = {
@@ -41,16 +33,15 @@
       ...
     }:
     let
-      # microsandbox requires KVM on Linux and Apple Silicon on macOS,
-      # so the package targets linux + aarch64-darwin only
-      packageSystems = [
+      # macOS only for now: the shared store is an APFS sparse image
+      # (hdiutil), and microsandbox needs Apple Silicon there
+      packageSystems = [ "aarch64-darwin" ];
+      # other systems keep a devShell for development
+      shellSystems = packageSystems ++ [
+        "x86_64-darwin"
         "x86_64-linux"
         "aarch64-linux"
-        "aarch64-darwin"
       ];
-      # x86_64-darwin keeps a devShell: developing is possible, running
-      # sandboxes is not (no Intel microsandbox runtime)
-      shellSystems = packageSystems ++ [ "x86_64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs packageSystems;
 
       bento =
@@ -65,40 +56,24 @@
           #     script's already-installed guard, skipping its download.
           # Keep in sync with the microsandbox dependency in Cargo.toml:
           # bumping it requires new hashes below.
-          msbVersion = "0.6.15";
+          msbVersion = "0.7.8";
           release = "https://github.com/superradcompany/microsandbox/releases/download/v${msbVersion}";
 
           target = {
-            x86_64-linux = {
-              arch = "x86_64";
-              os = "linux";
-              bundleHash = "sha256-dUZg25+Gucfwn0qjGPOf5XCN6A0qsDa0ouK/vHsGybA=";
-            };
-            aarch64-linux = {
-              arch = "aarch64";
-              os = "linux";
-              bundleHash = "sha256-+5hLe/rgfYFFQSLEaukVibHefNktZuaw8LQgcpDUWf0=";
-            };
-            aarch64-darwin = {
-              arch = "aarch64";
-              os = "darwin";
-              bundleHash = "sha256-4uqR9KHKK4223+J2zmnBlRKlp8WJBTXu2FkuyTZVoPs=";
-            };
-          }.${pkgs.stdenv.hostPlatform.system};
+            arch = "aarch64";
+            os = "darwin";
+            bundleHash = "sha256-Xb4Nkhxrb4B9LFn4fgo8OmSEJIcba+5RO4N6jGAKJJM=";
+          };
 
           runtimeBundle = pkgs.fetchurl {
             url = "${release}/microsandbox-${target.os}-${target.arch}.tar.gz";
             hash = target.bundleHash;
           };
 
-          # agentd runs as PID 1 inside the guest (always Linux), keyed by
-          # host arch only
+          # agentd runs as PID 1 inside the (always Linux) guest
           agentd = pkgs.fetchurl {
             url = "${release}/agentd-${target.arch}";
-            hash = {
-              x86_64 = "sha256-gWf39wcsZNnpct0YiKPQX/mUP2TPTl83Ymv+l0u+MCU=";
-              aarch64 = "sha256-dm7EfHTdb1zwZFjKDrE3o0BfxsBFrrmkawYBuAZKvYY=";
-            }.${target.arch};
+            hash = "sha256-G/yU0eOXQIIBDNwWv534b5ZU1SrChO/ktDn7xnj0JvM=";
           };
         in
         pkgs.rustPlatform.buildRustPackage {
@@ -142,18 +117,16 @@
             done
           '';
 
-          # git is a stateless runtime dependency used for repo discovery, so
-          # it is wrapped into PATH. Stateful tools (devenv, the microsandbox
-          # runtime) are intentionally not wrapped: bento runs the target
-          # repo's devenv against the user's nix, and the runtime is managed
-          # by `bento install`.
+          # git (repo discovery, in-box identity) is wrapped into PATH; the
+          # microsandbox runtime is managed by `bento install`, and nix on the
+          # host is not needed at runtime (it runs in the builder VM).
           postInstall = ''
             wrapProgram $out/bin/bento \
               --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.git ]}
           '';
 
           meta = {
-            description = "Run any repo's devenv inside a microsandbox box";
+            description = "Per-checkout microsandbox boxes on a shared nix store";
             mainProgram = "bento";
             platforms = packageSystems;
           };
@@ -185,24 +158,6 @@
       );
 
       overlays.default = final: _prev: { bento = bento final; };
-
-      nixosModules.bento =
-        {
-          config,
-          lib,
-          pkgs,
-          ...
-        }:
-        let
-          cfg = config.programs.bento;
-          bentoPkg = self.packages.${pkgs.stdenv.hostPlatform.system}.bento;
-        in
-        {
-          options.programs.bento.enable = lib.mkEnableOption "bento";
-          config = lib.mkIf cfg.enable {
-            environment.systemPackages = [ bentoPkg ];
-          };
-        };
 
       homeManagerModules.bento =
         {
