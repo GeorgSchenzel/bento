@@ -1,6 +1,6 @@
 mod agent;
 mod builder;
-mod repo;
+mod forest;
 mod sandbox;
 mod store;
 mod util;
@@ -17,7 +17,7 @@ use agent::Agent;
 #[derive(Debug, Parser)]
 #[command(
     name = "bento",
-    about = "Per-checkout microsandbox boxes on a shared nix store"
+    about = "Per-checkout and per-forest microsandbox boxes on a shared nix store"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -28,26 +28,28 @@ struct Cli {
 enum Command {
     #[command(about = "Install the microsandbox runtime and prepare the store and builder")]
     Install,
-    #[command(about = "(Re)create the box for this checkout")]
+    #[command(about = "(Re)create the box for this checkout or forest")]
     Start,
-    #[command(about = "Stop the box for this checkout")]
+    #[command(about = "Stop the box for this checkout or forest")]
     Stop,
-    #[command(about = "Open a shell in the box for this checkout")]
+    #[command(about = "Open a shell in the box for this checkout or forest")]
     Enter,
-    #[command(about = "Run claude in the box for this checkout")]
+    #[command(about = "Run claude in the box for this checkout or forest")]
     Claude {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    #[command(about = "Run opencode in the box for this checkout")]
+    #[command(about = "Run opencode in the box for this checkout or forest")]
     Opencode {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
     #[command(about = "Open a shell in the builder (owner of the shared nix store)")]
     Builder,
-    #[command(about = "Remove the box for this checkout and its state")]
-    Clean,
+    #[command(about = "Remove the box for this checkout or forest and its state")]
+    Rm,
+    #[command(about = "Remove the boxes whose checkout or forest is gone, and their state")]
+    Prune,
 }
 
 #[tokio::main]
@@ -87,23 +89,27 @@ async fn run(command: Command) -> Result<u8> {
             builder::enter().await
         }
         Command::Start => {
-            sandbox::create(&repo::discover()?).await?;
+            sandbox::create(&forest::discover()?).await?;
             Ok(0)
         }
         Command::Stop => {
-            sandbox::stop(&repo::discover()?).await?;
+            sandbox::stop(&forest::discover()?).await?;
             Ok(0)
         }
-        Command::Clean => {
-            sandbox::clean(&repo::discover()?).await?;
+        Command::Rm => {
+            sandbox::rm(&forest::discover()?).await?;
+            Ok(0)
+        }
+        Command::Prune => {
+            sandbox::prune().await?;
             Ok(0)
         }
         Command::Enter => {
             need_tty("bento enter")?;
-            let repo = repo::discover()?;
-            let sb = sandbox::ensure_running(&repo).await?;
-            println!("entering box '{}' (detach with Ctrl-])", repo.name);
-            util::attach(&sb, "bash", &[], sandbox::WORKDIR, util::term_env()).await
+            let forest = forest::discover()?;
+            let sb = sandbox::ensure_running(&forest).await?;
+            println!("entering box '{}' (detach with Ctrl-])", forest.name);
+            util::attach(&sb, "bash", &[], &forest.cwd, util::term_env()).await
         }
         Command::Claude { args } => run_agent(Agent::Claude, &args).await,
         Command::Opencode { args } => run_agent(Agent::Opencode, &args).await,
@@ -112,18 +118,18 @@ async fn run(command: Command) -> Result<u8> {
 
 async fn run_agent(agent: Agent, args: &[String]) -> Result<u8> {
     need_tty(&format!("bento {}", agent.command()))?;
-    let repo = repo::discover()?;
+    let forest = forest::discover()?;
     // fail on a missing token before creating anything
     let mut env = agent.env(&util::home()?)?;
-    let sb = sandbox::ensure_running(&repo).await?;
+    let sb = sandbox::ensure_running(&forest).await?;
     if let Agent::Opencode = agent {
-        let state = sandbox::state_dir(&repo)?;
+        let state = sandbox::state_dir(&forest)?;
         if let Err(e) = agent::import_opencode_credentials(&sb, &util::home()?, &state).await {
             eprintln!("bento: importing opencode credentials: {e:#}");
         }
     }
     env.extend(util::term_env());
-    util::attach(&sb, agent.command(), args, sandbox::WORKDIR, env).await
+    util::attach(&sb, agent.command(), args, &forest.cwd, env).await
 }
 
 fn need_tty(what: &str) -> Result<()> {

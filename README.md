@@ -1,12 +1,13 @@
 # bento
 
-Per-checkout [microsandbox](https://microsandbox.dev) boxes on a shared nix
-store, with claude and opencode inside.
+Per-checkout and per-forest [microsandbox](https://microsandbox.dev) boxes
+on a shared nix store, with claude and opencode inside.
 
 One **builder** VM per host owns a shared nix store and runs `nix-daemon`.
-Every checkout (or git worktree) gets its own **box**: a plain bash sandbox
-with the checkout at `/workspace`, the store mounted read-only and nix
-talking to the builder's daemon. Anything you `nix shell` or `nix build` in
+Every checkout (or git worktree), and every
+[forest](https://github.com/GeorgSchenzel/forest) workforest, gets its own
+**box**: a plain bash sandbox with the checkouts under `/workspace`, the
+store mounted read-only and nix talking to the builder's daemon. Anything you `nix shell` or `nix build` in
 one box lands in the shared store and is reused by all the others.
 
 macOS on Apple Silicon only, for now.
@@ -44,7 +45,7 @@ needed.
 
 ## Usage
 
-Run these from inside a checkout:
+Run these from inside a checkout or a forest:
 
 ```
 bento enter      # bash in this checkout's box (created/started on demand)
@@ -52,13 +53,32 @@ bento claude     # claude in the box (args are passed through)
 bento opencode   # opencode in the box (args are passed through)
 bento start      # (re)create the box, applying config changes
 bento stop       # stop the box (the builder keeps running)
-bento clean      # remove the box, its agent state and .bento/
+bento rm         # remove the box and its state
+bento prune      # remove the boxes whose checkout or forest is gone
 bento builder    # bash in the builder VM
 ```
 
-The box is named after the checkout: `bento_<project>` for a main checkout,
-`bento_<project>_<dir>` for a linked worktree. In a worktree box, `git
-commit` works and the commit lands in the host repo.
+A box holds a forest of checkouts; a single checkout is a forest of one.
+Each checkout is at `/workspace/<project>`, named after the project's dir
+in the host layout (`~/projects/<project>/<branch>` →
+`/workspace/<project>`). Commands start in the guest dir matching the host
+cwd: `/workspace/backend/src` from `backend/src`, `/workspace` from the
+forest root.
+
+- **Checkout:** `bento_<project>` for a main checkout,
+  `bento_<project>_<dir>` for a linked worktree.
+- **Forest:** anywhere inside `<root>/forests/<name>/` (forest's layout,
+  with `<root>/repos/` beside it), including its checkouts, targets the
+  forest's box `bento-forest_<name>`, with every checkout of the forest in
+  it. A checkout added to the forest later shows up after `bento start`.
+
+Boxes are keyed by path: after `forest rm`, `forest clean` or `forest mv`
+the old box and its state (agent history included) are left behind;
+`bento prune` removes them.
+
+`git commit` works in every checkout and lands in the host repo.
+`/workspace` itself is box-owned (`boxes/<box>/root` on the host), so files
+written there stay out of the host forest dir.
 
 ### Agents
 
@@ -82,18 +102,32 @@ Plugins that call host-only binaries won't work in the box.
 
 ### devenv
 
-If the checkout has a `devenv.nix`, `enter`, `claude` and `opencode` run
-inside its `devenv shell`, and `.devenv` is overlaid like `target` (see
-below). The first activation builds the shell through the builder and can
-take minutes; after that it's cached in the shared store.
+`enter`, `claude` and `opencode` run inside the `devenv shell` of the
+nearest `devenv.nix` up from the cwd, and each checkout's `.devenv` is
+overlaid like `target` (see below). The first activation builds the shell
+through the builder and can take minutes; after that it's cached in the
+shared store.
+
+At the forest root, bento generates a combined devenv at `/workspace` that
+imports every checkout's devenv, so an agent started there has all their
+tools. Inside a checkout, its own devenv is nearer and wins. Caveats of the
+combined shell:
+
+- Relative paths in a checkout's devenv (`languages.python.directory`,
+  `config.devenv.root`) resolve against `/workspace`, not the checkout.
+- Two checkouts setting an option to different values fail to evaluate.
+  Put a `devenv.nix` in the host forest dir to resolve it (`lib.mkForce`);
+  it is layered on top of the generated imports. A `devenv.yaml` there
+  replaces the generated one.
+- It has its own `devenv.lock`; the checkouts' locks don't apply.
 
 ### bento.yaml
 
-Optional, at the checkout root:
+Optional, at the checkout root (per checkout in a forest):
 
 ```yaml
-# Repo dirs the box shadows with its own (linux) copies under .bento/ov/,
-# so host and box build artifacts never mix. Add .bento/ to .gitignore.
+# Repo dirs the box shadows with its own (linux) copies, kept in the box's
+# state dir, so host and box build artifacts never mix.
 overlay:
   - target
 # GiB the box may add to each writable mount (default 64).
@@ -106,7 +140,8 @@ quota_gib: 64
 ~/.local/share/bento/
 ├── store.sparseimage   case-sensitive APFS, sparse, max 60 GB
 ├── store/nix           its mountpoint; /nix for the builder and every box
-└── boxes/<box>/        per-box agent state and generated git config
+└── boxes/<box>/        per-box state: root/ (/workspace), ov/ (overlays),
+                        agent state, generated git config
 
 bento-builder           /nix rw, nix-daemon ← socat TCP, 127.0.0.1:17760
 bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:17760
