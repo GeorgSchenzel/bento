@@ -144,9 +144,8 @@ pub async fn run_streamed(sb: &Sandbox, what: &str, script: String) -> Result<()
 
 /// Installs the host's terminfo entry when the guest has none for TERM (e.g.
 /// xterm-ghostty), falling back to a generic TERM, then execs the command,
-/// inside the nearest devenv up from the cwd when there is one: the tree's
-/// own, or the forest's combined one at /workspace. devenv itself finds that
-/// root. The host locale is applied in there, where devenv's locale archive
+/// inside the nearest devenv up from the cwd when there is one (the tree's;
+/// the forest root has none). devenv itself finds that root. The host locale is applied in there, where devenv's locale archive
 /// is visible: a locale the box lacks becomes C.UTF-8 (built into glibc), or
 /// is dropped if it isn't UTF-8.
 const ATTACH_WRAPPER: &str = r#"if ! infocmp "$TERM" >/dev/null 2>&1; then

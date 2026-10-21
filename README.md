@@ -64,7 +64,7 @@ Each checkout is at `/workspace/<project>`, named after the project's dir
 in the host layout (`~/projects/<project>/<branch>` →
 `/workspace/<project>`). Commands start in the guest dir matching the host
 cwd: `/workspace/backend/src` from `backend/src`, `/workspace` from the
-forest root.
+forest root (or the checkout itself, in a forest of one).
 
 - **Checkout:** `bento_<project>` for a main checkout,
   `bento_<project>_<dir>` for a linked worktree.
@@ -109,18 +109,8 @@ overlaid like `target` (see below). The first activation builds the shell
 through the builder and can take minutes; after that it's cached in the
 shared store.
 
-At the forest root, bento generates a combined devenv at `/workspace` that
-imports every checkout's devenv, so an agent started there has all their
-tools. Inside a checkout, its own devenv is nearer and wins. Caveats of the
-combined shell:
-
-- Relative paths in a checkout's devenv (`languages.python.directory`,
-  `config.devenv.root`) resolve against `/workspace`, not the checkout.
-- Two checkouts setting an option to different values fail to evaluate.
-  Put a `devenv.nix` in the host forest dir to resolve it (`lib.mkForce`);
-  it is layered on top of the generated imports. A `devenv.yaml` there
-  replaces the generated one.
-- It has its own `devenv.lock`; the checkouts' locks don't apply.
+At the root of a forest with several checkouts there is no devenv shell;
+`cd` into a checkout for its tools. A forest of one starts in its checkout.
 
 ### Docker
 
