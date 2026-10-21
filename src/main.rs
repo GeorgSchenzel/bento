@@ -116,6 +116,12 @@ async fn run_agent(agent: Agent, args: &[String]) -> Result<u8> {
     // fail on a missing token before creating anything
     let mut env = agent.env(&util::home()?)?;
     let sb = sandbox::ensure_running(&repo).await?;
+    if let Agent::Opencode = agent {
+        let state = sandbox::state_dir(&repo)?;
+        if let Err(e) = agent::import_opencode_credentials(&sb, &util::home()?, &state).await {
+            eprintln!("bento: importing opencode credentials: {e:#}");
+        }
+    }
     env.extend(util::term_env());
     util::attach(&sb, agent.command(), args, sandbox::WORKDIR, env).await
 }
