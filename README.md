@@ -54,6 +54,7 @@ bento opencode   # opencode in the box (args are passed through)
 bento start      # (re)create the box, applying config changes
 bento stop       # stop the box (the builder keeps running)
 bento rm         # remove the box and its state
+bento ls         # list the boxes: status, disk use, checkout or forest (gone ones marked)
 bento prune      # remove the boxes whose checkout or forest is gone
 bento builder    # bash in the builder VM
 ```

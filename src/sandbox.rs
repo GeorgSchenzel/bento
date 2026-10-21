@@ -326,13 +326,13 @@ pub async fn rm(forest: &Forest) -> Result<()> {
     if let Ok(handle) = Sandbox::get(&forest.name).await {
         guard(&handle, forest)?;
     }
-    remove(&forest.name).await
+    remove(&forest.name).await?;
+    Ok(())
 }
 
-/// Remove every box whose checkout or forest is gone (deleted, or renamed
-/// by `forest mv`), with its state dir.
-pub async fn prune() -> Result<()> {
-    let mut gone = Vec::new();
+/// Every bento box (sandboxes labeled with the path they belong to), by name.
+async fn boxes() -> Result<Vec<(SandboxHandle, String)>> {
+    let mut boxes = Vec::new();
     let mut cursor: Option<String> = None;
     loop {
         let page = Sandbox::list_with(|l| match cursor.take() {
@@ -341,11 +341,9 @@ pub async fn prune() -> Result<()> {
         })
         .await
         .context("listing boxes")?;
-        for handle in &page.sandboxes {
-            if let Some(path) = util::label(handle, "bento.path") {
-                if !Path::new(&path).exists() {
-                    gone.push((handle.name().to_string(), path));
-                }
+        for handle in page.sandboxes {
+            if let Some(path) = util::label(&handle, "bento.path") {
+                boxes.push((handle, path));
             }
         }
         match page.next_cursor {
@@ -353,25 +351,107 @@ pub async fn prune() -> Result<()> {
             None => break,
         }
     }
-    if gone.is_empty() {
-        println!("nothing to prune");
+    boxes.sort_by(|a, b| a.0.name().cmp(b.0.name()));
+    Ok(boxes)
+}
+
+/// Print every box with its status, disk use and the checkout or forest it
+/// belongs to.
+pub async fn ls() -> Result<()> {
+    let boxes = boxes().await?;
+    if boxes.is_empty() {
+        println!("no boxes");
+        return Ok(());
     }
-    for (name, path) in gone {
-        println!("box '{name}': {path} is gone");
-        remove(&name).await?;
+    let mut rows = Vec::new();
+    for (handle, path) in &boxes {
+        let status = format!("{:?}", handle.status_snapshot()).to_lowercase();
+        let size = match size(handle.name()).await {
+            Ok(bytes) => util::human_bytes(bytes),
+            Err(_) => "?".into(),
+        };
+        let gone = if Path::new(path).exists() { "" } else { " (gone)" };
+        rows.push((handle.name().to_string(), status, size, format!("{path}{gone}")));
+    }
+    let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
+    let status_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(6);
+    let size_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(4);
+    println!("{:name_w$}  {:status_w$}  {:>size_w$}  PATH", "NAME", "STATUS", "SIZE");
+    for (name, status, size, path) in rows {
+        println!("{name:name_w$}  {status:status_w$}  {size:>size_w$}  {path}");
     }
     Ok(())
 }
 
-async fn remove(name: &str) -> Result<()> {
-    if util::remove_sandbox(name).await? {
+/// Disk a box takes that `bento rm` frees: msb's sandbox dir (the rootfs
+/// layer the box writes) plus its state dir (/workspace root, overlays, agent
+/// state). Bound checkouts and the shared store are not counted.
+async fn size(name: &str) -> Result<u64> {
+    let msb = match Sandbox::get(name).await {
+        Ok(handle) => {
+            let usage = handle.storage_usage().await?;
+            usage
+                .allocated_bytes
+                .or(usage.logical_bytes)
+                .context("sandbox dir scan incomplete")?
+        }
+        Err(MicrosandboxError::SandboxNotFound(_)) => 0,
+        Err(err) => return Err(err).with_context(|| format!("looking up box '{name}'")),
+    };
+    Ok(msb + util::disk_usage(&box_state_dir(name)?)?)
+}
+
+/// Remove every box whose checkout or forest is gone (deleted, or renamed
+/// by `forest mv`), with its state dir.
+pub async fn prune() -> Result<()> {
+    let gone: Vec<(String, String)> = boxes()
+        .await?
+        .into_iter()
+        .filter(|(_, path)| !Path::new(path).exists())
+        .map(|(handle, path)| (handle.name().to_string(), path))
+        .collect();
+    if gone.is_empty() {
+        println!("nothing to prune");
+    }
+    let mut total = Some(0);
+    for (name, path) in &gone {
+        println!("box '{name}': {path} is gone");
+        let freed = remove(name).await?;
+        total = total.zip(freed).map(|(t, f)| t + f);
+    }
+    if gone.len() > 1 {
+        if let Some(total) = total {
+            println!("freed {} in total", util::human_bytes(total));
+        }
+    }
+    Ok(())
+}
+
+/// Remove a box and its state dir; returns the bytes freed, or None when
+/// they could not be measured (removal goes ahead regardless).
+async fn remove(name: &str) -> Result<Option<u64>> {
+    let freed = match size(name).await {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            eprintln!("bento: measuring box '{name}': {e:#}");
+            None
+        }
+    };
+    let mut removed = util::remove_sandbox(name).await?;
+    if removed {
         println!("box '{name}': removed");
     }
     let dir = box_state_dir(name)?;
     match fs::remove_dir_all(&dir) {
-        Ok(()) => println!("removed {}", dir.display()),
+        Ok(()) => {
+            println!("removed {}", dir.display());
+            removed = true;
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
         Err(e) => return Err(e).with_context(|| format!("removing {}", dir.display())),
     }
-    Ok(())
+    if let (true, Some(bytes)) = (removed, freed) {
+        println!("box '{name}': freed {}", util::human_bytes(bytes));
+    }
+    Ok(freed)
 }

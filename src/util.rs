@@ -1,5 +1,5 @@
 use std::io::Write as _;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
 use microsandbox::sandbox::Sandbox;
@@ -18,6 +18,40 @@ pub fn data_dir() -> Result<PathBuf> {
     let dir = home()?.join(".local/share/bento");
     std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     Ok(dir)
+}
+
+/// Allocated bytes under a dir, like `du -s` (symlinks are not followed, so
+/// sparse files count what they occupy); a missing dir is 0.
+pub fn disk_usage(path: &Path) -> Result<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
+    let mut total = meta.blocks() * 512;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+            total += disk_usage(&entry?.path())?;
+        }
+    }
+    Ok(total)
+}
+
+/// `1.4G`-style size, powers of 1024 like `du -h`.
+pub fn human_bytes(bytes: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
+    let mut size = bytes as f64;
+    let mut unit = 0;
+    while size >= 1024.0 && unit < UNITS.len() - 1 {
+        size /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 || size >= 10.0 {
+        format!("{size:.0}{}", UNITS[unit])
+    } else {
+        format!("{size:.1}{}", UNITS[unit])
+    }
 }
 
 /// FNV-1a: a stable fingerprint for sandbox labels (std's hasher may change

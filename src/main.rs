@@ -48,6 +48,8 @@ enum Command {
     Builder,
     #[command(about = "Remove the box for this checkout or forest and its state")]
     Rm,
+    #[command(about = "List the boxes with their status and checkout or forest")]
+    Ls,
     #[command(about = "Remove the boxes whose checkout or forest is gone, and their state")]
     Prune,
 }
@@ -98,6 +100,10 @@ async fn run(command: Command) -> Result<u8> {
         }
         Command::Rm => {
             sandbox::rm(&forest::discover()?).await?;
+            Ok(0)
+        }
+        Command::Ls => {
+            sandbox::ls().await?;
             Ok(0)
         }
         Command::Prune => {
