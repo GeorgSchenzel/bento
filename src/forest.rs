@@ -130,7 +130,8 @@ fn workforest(root: &Path, cwd: &Path) -> Result<Forest> {
     if trees.is_empty() {
         bail!("forest {} has no checkouts", root.display());
     }
-    // cwd in a tree maps into it; anywhere else in the forest is its root
+    // cwd in a tree maps into it; anywhere else in the forest is its root,
+    // or the tree itself when there is only one
     let rel = cwd.strip_prefix(root).unwrap_or(Path::new(""));
     let cwd = match rel.components().next() {
         Some(Component::Normal(first)) => trees
@@ -138,7 +139,11 @@ fn workforest(root: &Path, cwd: &Path) -> Result<Forest> {
             .find(|t| t.dir.file_name() == Some(first))
             .map(|t| guest_path(&t.name, rel.strip_prefix(first).unwrap_or(Path::new("")))),
         _ => None,
-    };
+    }
+    .or_else(|| match trees.as_slice() {
+        [only] => Some(guest_path(&only.name, Path::new(""))),
+        _ => None,
+    });
     Ok(Forest {
         name: box_name(&format!("bento-forest_{}", slug(&dir_basename(root)))),
         dir: root.to_path_buf(),
