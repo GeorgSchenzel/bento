@@ -67,15 +67,34 @@ pub fn fingerprint(parts: &[&str]) -> String {
     format!("{h:016x}")
 }
 
-/// Host terminal identity for attach sessions; the SDK does not propagate
-/// TERM, and TUIs (claude, opencode) need it.
+/// Host terminal identity and locale for attach sessions; the SDK does not
+/// propagate them, and TUIs (claude, opencode) detect terminal features from
+/// them. The host's terminfo entry and locale go in as BENTO_* for
+/// ATTACH_WRAPPER, which installs / applies them when the box supports them.
 pub fn term_env() -> Vec<(String, String)> {
-    let mut env = vec![(
-        "TERM".to_string(),
-        std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
-    )];
-    if let Ok(colorterm) = std::env::var("COLORTERM") {
-        env.push(("COLORTERM".to_string(), colorterm));
+    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
+    let mut env = vec![("TERM".to_string(), term.clone())];
+    for key in ["COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
+        if let Ok(value) = std::env::var(key) {
+            env.push((key.to_string(), value));
+        }
+    }
+    for (key, value) in std::env::vars() {
+        if key == "LANG" || key.starts_with("LC_") {
+            env.push((format!("BENTO_{key}"), value));
+        }
+    }
+    let terminfo = std::process::Command::new("infocmp")
+        .args(["-x", &term])
+        .stderr(std::process::Stdio::null())
+        .output();
+    if let Ok(out) = terminfo {
+        if out.status.success() {
+            env.push((
+                "BENTO_TERMINFO".to_string(),
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+            ));
+        }
     }
     env
 }
@@ -123,15 +142,30 @@ pub async fn run_streamed(sb: &Sandbox, what: &str, script: String) -> Result<()
     bail!("{what}: lost connection to the sandbox")
 }
 
-/// Falls back to a generic TERM when the guest has no terminfo for the
-/// host's (e.g. a new terminal emulator), then execs the command, inside the
-/// nearest devenv up from the cwd when there is one: the tree's own, or the
-/// forest's combined one at /workspace. devenv itself finds that root.
-const ATTACH_WRAPPER: &str = r#"infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
+/// Installs the host's terminfo entry when the guest has none for TERM (e.g.
+/// xterm-ghostty), falling back to a generic TERM, then execs the command,
+/// inside the nearest devenv up from the cwd when there is one: the tree's
+/// own, or the forest's combined one at /workspace. devenv itself finds that
+/// root. The host locale is applied in there, where devenv's locale archive
+/// is visible: a locale the box lacks becomes C.UTF-8 (built into glibc), or
+/// is dropped if it isn't UTF-8.
+const ATTACH_WRAPPER: &str = r#"if ! infocmp "$TERM" >/dev/null 2>&1; then
+  [ -n "$BENTO_TERMINFO" ] && printf '%s\n' "$BENTO_TERMINFO" | tic -x -o "$HOME/.terminfo" /dev/stdin >/dev/null 2>&1
+  infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
+fi
+unset BENTO_TERMINFO
+locale='for k in $(compgen -e); do
+  case $k in BENTO_LANG|BENTO_LC_*) ;; *) continue ;; esac
+  v=${!k}; unset "$k"
+  if [ -z "$(LC_ALL=$v bash -c : 2>&1)" ]; then export "${k#BENTO_}=$v"
+  else case $v in *[Uu][Tt][Ff]*8*) export "${k#BENTO_}=C.UTF-8" ;; esac
+  fi
+done
+exec "$@"'
 d=$PWD
 while [ "$d" != / ] && [ ! -f "$d/devenv.nix" ]; do d=$(dirname "$d"); done
-[ -f "$d/devenv.nix" ] && exec devenv shell -- "$0" "$@"
-exec "$0" "$@""#;
+[ -f "$d/devenv.nix" ] && exec devenv shell -- bash -c "$locale" bash "$0" "$@"
+exec bash -c "$locale" bash "$0" "$@""#;
 
 /// Attach an interactive command; returns the process exit code.
 pub async fn attach(

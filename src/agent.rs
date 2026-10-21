@@ -52,10 +52,12 @@ impl Agent {
                         path.display()
                     )
                 })?;
-                Ok(vec![(
-                    "CLAUDE_CODE_OAUTH_TOKEN".into(),
-                    token.trim().to_string(),
-                )])
+                Ok(vec![
+                    ("CLAUDE_CODE_OAUTH_TOKEN".into(), token.trim().to_string()),
+                    // The fullscreen TUI is gated by an account feature flag,
+                    // which a setup-token can't fetch (no profile scope).
+                    ("CLAUDE_CODE_NO_FLICKER".into(), "1".into()),
+                ])
             }
             Agent::Opencode => Ok(vec![]),
         }
