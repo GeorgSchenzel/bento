@@ -122,6 +122,18 @@ combined shell:
   replaces the generated one.
 - It has its own `devenv.lock`; the checkouts' locks don't apply.
 
+### Docker
+
+Every box runs its own `dockerd` (with compose and buildx), started on
+every connect; `docker` just works in `enter`, `claude` and `opencode`.
+Its data root `/var/lib/docker` is an ext4 disk image,
+`boxes/<box>/docker.raw` (docker's overlayfs can't stack on the box's
+overlay rootfs). It is sparse, sized by `quota_gib`, and kept when the box
+is recreated, so pulled images and volumes survive `bento start`; `bento rm`
+deletes it. Ports published with `-p` are reachable inside the box only.
+The image never shrinks on the host; `docker system prune` frees space for
+reuse inside it. Log: `/tmp/dockerd.log` in the box.
+
 ### bento.yaml
 
 Optional, at the checkout root (per checkout in a forest):
@@ -131,7 +143,8 @@ Optional, at the checkout root (per checkout in a forest):
 # state dir, so host and box build artifacts never mix.
 overlay:
   - target
-# GiB the box may add to each writable mount (default 64).
+# GiB the box may add to each writable mount, and the size of its docker
+# disk (default 64).
 quota_gib: 64
 ```
 
@@ -142,7 +155,8 @@ quota_gib: 64
 ├── store.sparseimage   case-sensitive APFS, sparse, max 60 GB
 ├── store/nix           its mountpoint; /nix for the builder and every box
 └── boxes/<box>/        per-box state: root/ (/workspace), ov/ (overlays),
-                        agent state, generated git config
+                        docker.raw (/var/lib/docker), agent state,
+                        generated git config
 
 bento-builder           /nix rw, nix-daemon ← socat TCP, 127.0.0.1:17760
 bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:17760
@@ -151,7 +165,7 @@ bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:
 
 - The builder is the only process that writes to the store. Locks don't
   work across microsandbox VMs, so two VMs writing the same store corrupt it.
-- The box tools (claude-code, opencode, git, socat, ncurses) come from a
+- The box tools (claude-code, opencode, devenv, docker, git, socat, ncurses) come from a
   flake that is embedded in the binary (`tools/`). The builder builds it
   into the GC root `/nix/var/nix/gcroots/bento/tools`, and boxes have its
   `bin/` on PATH. Changing the flake rebuilds the tools on the next command.

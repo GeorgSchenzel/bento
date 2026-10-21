@@ -6,9 +6,10 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{bail, Context as _, Result};
+use anyhow::{anyhow, bail, Context as _, Result};
 use microsandbox::sandbox::{Sandbox, SandboxHandle};
 use microsandbox::{MicrosandboxError, NetworkPolicy, NetworkProfile};
+use microsandbox_image::ext4::{format_ext4, Ext4FormatOptions};
 
 use crate::agent;
 use crate::builder;
@@ -20,14 +21,24 @@ use crate::util;
 /// bound rw at /git/<tree> (commits write objects/refs/index through it).
 const GUEST_GIT: &str = "/git";
 const NIX_SOCK: &str = "/tmp/nix.sock";
+const DOCKER_ROOT: &str = "/var/lib/docker";
+const DOCKER_SOCK: &str = "/var/run/docker.sock";
 
-/// One bind mount. Writable ones always carry a quota: msb's default is
-/// 4 GiB of guest-added bytes, past which writes fail with ENOSPC.
+/// One mount: a bind, or an ext4 disk image. Writable binds always carry a
+/// quota: msb's default is 4 GiB of guest-added bytes, past which writes
+/// fail with ENOSPC.
 #[derive(Debug)]
 pub struct Mount {
     guest: String,
     host: PathBuf,
-    quota: Option<u32>,
+    kind: MountKind,
+}
+
+#[derive(Debug)]
+enum MountKind {
+    Ro,
+    Rw(u32),
+    Disk,
 }
 
 impl Mount {
@@ -35,7 +46,7 @@ impl Mount {
         Mount {
             guest: guest.as_ref().display().to_string(),
             host: host.into(),
-            quota: None,
+            kind: MountKind::Ro,
         }
     }
 
@@ -43,7 +54,15 @@ impl Mount {
         Mount {
             guest: guest.as_ref().display().to_string(),
             host: host.into(),
-            quota: Some(quota_mib),
+            kind: MountKind::Rw(quota_mib),
+        }
+    }
+
+    fn disk(guest: impl AsRef<Path>, host: impl Into<PathBuf>) -> Self {
+        Mount {
+            guest: guest.as_ref().display().to_string(),
+            host: host.into(),
+            kind: MountKind::Disk,
         }
     }
 }
@@ -116,6 +135,7 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
         }
     }
     mounts.push(Mount::ro(home.join(".gitconfig"), write_gitconfig(forest, state)?));
+    mounts.push(Mount::disk(DOCKER_ROOT, docker_disk(state, forest.quota_mib())?));
     mounts.extend(agent::mounts(home, state, forest.quota_mib())?);
     Ok(mounts)
 }
@@ -160,6 +180,23 @@ fn devenv(forest: &Forest, root: &Path) -> Result<Vec<Mount>> {
         }
     }
     Ok(mounts)
+}
+
+/// Docker's data root: an ext4 image in the state dir (docker's overlayfs
+/// can't stack on the box's overlay rootfs). It outlives box recreation, so
+/// pulled images and volumes survive `bento start`; `bento rm` deletes it.
+/// Sparse: the host only pays for what is written.
+fn docker_disk(state: &Path, size_mib: u32) -> Result<PathBuf> {
+    let path = state.join("docker.raw");
+    if !path.exists() {
+        let opts = Ext4FormatOptions {
+            size_bytes: u64::from(size_mib) * 1024 * 1024,
+            ..Default::default()
+        };
+        format_ext4(&path, &opts)
+            .map_err(|e| anyhow!("formatting {}: {e:?}", path.display()))?;
+    }
+    Ok(path)
 }
 
 fn write(state: &Path, name: &str, text: &str) -> Result<PathBuf> {
@@ -230,9 +267,10 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
             ]))
         });
     for m in mounts {
-        sb = sb.volume(m.guest, |b| match m.quota {
-            Some(q) => b.bind(&m.host).quota(q),
-            None => b.bind(&m.host).readonly(),
+        sb = sb.volume(m.guest, |b| match m.kind {
+            MountKind::Ro => b.bind(&m.host).readonly(),
+            MountKind::Rw(q) => b.bind(&m.host).quota(q),
+            MountKind::Disk => b.disk(&m.host).fstype("ext4"),
         });
     }
     println!("box '{}': creating", forest.name);
@@ -240,7 +278,7 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
         .create_detached()
         .await
         .with_context(|| format!("creating box '{}'", forest.name))?;
-    forward_nix(&sb).await?;
+    services(&sb).await?;
     Ok(sb)
 }
 
@@ -283,27 +321,43 @@ pub async fn ensure_running(forest: &Forest) -> Result<Sandbox> {
         }
         Err(err) => return Err(err).with_context(|| format!("connecting to box '{}'", forest.name)),
     };
-    forward_nix(&sb).await?;
+    services(&sb).await?;
     Ok(sb)
 }
 
 /// Background processes don't survive stop→start, so the socket forwarder to
-/// the builder's daemon is (re)started on every connect when not running.
-async fn forward_nix(sb: &Sandbox) -> Result<()> {
+/// the builder's daemon and dockerd are (re)started on every connect when not
+/// running.
+async fn services(sb: &Sandbox) -> Result<()> {
     let script = format!(
-        r#"p=$(cat /tmp/nix-fwd.pid 2>/dev/null)
-if [ -n "$p" ] && grep -qa socat /proc/$p/cmdline 2>/dev/null; then exit 0; fi
-rm -f {NIX_SOCK}
-nohup {tools}/bin/socat UNIX-LISTEN:{NIX_SOCK},fork TCP:host.microsandbox.internal:{port} </dev/null >/tmp/nix-fwd.log 2>&1 &
-echo $! > /tmp/nix-fwd.pid
-for i in $(seq 50); do [ -S {NIX_SOCK} ] && exit 0; sleep 0.1; done
-echo "nix socket forwarder did not start:" >&2; cat /tmp/nix-fwd.log >&2; exit 1"#,
+        // pid files outlive a stop (/tmp is on the rootfs) and pids repeat
+        // across boots, so check the pid's executable, not its cmdline (this
+        // script's own cmdline names both)
+        r#"running() {{ p=$(cat /tmp/$1.pid 2>/dev/null); case "$(readlink /proc/$p/exe 2>/dev/null)" in */$2*|*/.$2*) true;; *) false;; esac; }}
+if ! running nix-fwd socat; then
+  rm -f {NIX_SOCK}
+  nohup {tools}/bin/socat UNIX-LISTEN:{NIX_SOCK},fork TCP:host.microsandbox.internal:{port} </dev/null >/tmp/nix-fwd.log 2>&1 &
+  echo $! > /tmp/nix-fwd.pid
+fi
+if ! running dockerd dockerd; then
+  rm -f {DOCKER_SOCK}
+  nohup {tools}/bin/dockerd --data-root {DOCKER_ROOT} </dev/null >/tmp/dockerd.log 2>&1 &
+  echo $! > /tmp/dockerd.pid
+fi
+for i in $(seq 50); do [ -S {NIX_SOCK} ] && break; sleep 0.1; done
+[ -S {NIX_SOCK} ] || {{ echo "nix socket forwarder did not start:" >&2; cat /tmp/nix-fwd.log >&2; exit 1; }}
+for i in $(seq 100); do [ -S {DOCKER_SOCK} ] && exit 0; sleep 0.1; done
+echo "warning: dockerd did not start (log: /tmp/dockerd.log in the box):" >&2; tail -5 /tmp/dockerd.log >&2"#,
         tools = builder::TOOLS,
         port = builder::PORT,
     );
-    let out = sb.shell(script).await.context("starting the nix forwarder")?;
+    let out = sb.shell(script).await.context("starting the box services")?;
+    let stderr = out.stderr().unwrap_or_default();
     if !out.status().success {
-        bail!("{}", out.stderr().unwrap_or_default().trim());
+        bail!("{}", stderr.trim());
+    }
+    if !stderr.trim().is_empty() {
+        eprintln!("{}", stderr.trim());
     }
     Ok(())
 }

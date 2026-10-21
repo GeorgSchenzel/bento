@@ -531,6 +531,7 @@ dependencies = [
  "anyhow",
  "clap",
  "microsandbox",
+ "microsandbox-image",
  "serde",
  "serde_json",
  "serde_yaml",

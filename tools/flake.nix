@@ -32,6 +32,7 @@
               claude-code
               opencode.packages.${system}.opencode
               devenv # boxes run in the checkout's devenv shell
+              docker # dockerd runs in every box; includes compose and buildx
               git
               socat
               ncurses # terminfo for the host's TERM
