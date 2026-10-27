@@ -85,10 +85,16 @@ fn env(home: &Path) -> Vec<(String, String)> {
             "NIX_CONFIG".into(),
             "experimental-features = nix-command flakes".into(),
         ),
-        ("TERMINFO_DIRS".into(), format!("{}/share/terminfo", builder::TOOLS)),
+        (
+            "TERMINFO_DIRS".into(),
+            format!("{}/share/terminfo", builder::TOOLS),
+        ),
         (
             "PATH".into(),
-            format!("{}/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin", builder::TOOLS),
+            format!(
+                "{}/bin:/nix/var/nix/profiles/default/bin:/usr/bin:/bin",
+                builder::TOOLS
+            ),
         ),
     ];
     env.extend(agent::sandbox_env(home));
@@ -129,14 +135,27 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
                 &format!("gitdir-pointer-{}", tree.name),
                 &format!("gitdir: {git}/worktrees/{}\n", wt.wt_id),
             )?;
-            let back = write(state, &format!("gitdir-back-{}", tree.name), &format!("{guest}/.git\n"))?;
+            let back = write(
+                state,
+                &format!("gitdir-back-{}", tree.name),
+                &format!("{guest}/.git\n"),
+            )?;
             mounts.push(Mount::rw(&git, &wt.main_git, quota));
             mounts.push(Mount::ro(format!("{guest}/.git"), pointer));
-            mounts.push(Mount::ro(format!("{git}/worktrees/{}/gitdir", wt.wt_id), back));
+            mounts.push(Mount::ro(
+                format!("{git}/worktrees/{}/gitdir", wt.wt_id),
+                back,
+            ));
         }
     }
-    mounts.push(Mount::ro(home.join(".gitconfig"), write_gitconfig(forest, state)?));
-    mounts.push(Mount::disk(DOCKER_ROOT, docker_disk(state, forest.quota_mib())?));
+    mounts.push(Mount::ro(
+        home.join(".gitconfig"),
+        write_gitconfig(forest, state)?,
+    ));
+    mounts.push(Mount::disk(
+        DOCKER_ROOT,
+        docker_disk(state, forest.quota_mib())?,
+    ));
     mounts.extend(agent::mounts(home, state, forest.quota_mib())?);
     Ok(mounts)
 }
@@ -212,8 +231,7 @@ fn docker_disk(state: &Path, size_mib: u32) -> Result<PathBuf> {
             size_bytes: u64::from(size_mib) * 1024 * 1024,
             ..Default::default()
         };
-        format_ext4(&path, &opts)
-            .map_err(|e| anyhow!("formatting {}: {e:?}", path.display()))?;
+        format_ext4(&path, &opts).map_err(|e| anyhow!("formatting {}: {e:?}", path.display()))?;
     }
     Ok(path)
 }
@@ -344,7 +362,9 @@ pub async fn ensure_running(forest: &Forest) -> Result<Sandbox> {
             util::record_dns(&state.join("host-dns"));
             sb
         }
-        Err(err) => return Err(err).with_context(|| format!("connecting to box '{}'", forest.name)),
+        Err(err) => {
+            return Err(err).with_context(|| format!("connecting to box '{}'", forest.name))
+        }
     };
     services(&sb).await?;
     Ok(sb)
@@ -376,7 +396,10 @@ echo "warning: dockerd did not start (log: /tmp/dockerd.log in the box):" >&2; t
         tools = builder::TOOLS,
         port = builder::PORT,
     );
-    let out = sb.shell(script).await.context("starting the box services")?;
+    let out = sb
+        .shell(script)
+        .await
+        .context("starting the box services")?;
     let stderr = out.stderr().unwrap_or_default();
     if !out.status().success {
         bail!("{}", stderr.trim());
@@ -460,8 +483,17 @@ pub async fn ls() -> Result<()> {
             Ok(bytes) => util::human_bytes(bytes),
             Err(_) => "?".into(),
         };
-        let gone = if Path::new(path).exists() { "" } else { " (gone)" };
-        rows.push((handle.name().to_string(), status, size, format!("{path}{gone}")));
+        let gone = if Path::new(path).exists() {
+            ""
+        } else {
+            " (gone)"
+        };
+        rows.push((
+            handle.name().to_string(),
+            status,
+            size,
+            format!("{path}{gone}"),
+        ));
     }
     if rows.is_empty() {
         println!("no boxes");
@@ -470,7 +502,10 @@ pub async fn ls() -> Result<()> {
     let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
     let status_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(6);
     let size_w = rows.iter().map(|r| r.2.len()).max().unwrap_or(0).max(4);
-    println!("{:name_w$}  {:status_w$}  {:>size_w$}  PATH", "NAME", "STATUS", "SIZE");
+    println!(
+        "{:name_w$}  {:status_w$}  {:>size_w$}  PATH",
+        "NAME", "STATUS", "SIZE"
+    );
     for (name, status, size, path) in rows {
         println!("{name:name_w$}  {status:status_w$}  {size:>size_w$}  {path}");
     }

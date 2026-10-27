@@ -51,7 +51,9 @@ enum Command {
     },
     #[command(about = "Remove the box for this checkout or forest and its state")]
     Rm,
-    #[command(about = "List the builder and the boxes with their status, disk use and checkout or forest")]
+    #[command(
+        about = "List the builder and the boxes with their status, disk use and checkout or forest"
+    )]
     Ls,
     #[command(about = "Remove the boxes whose checkout or forest is gone, and their state")]
     Prune,

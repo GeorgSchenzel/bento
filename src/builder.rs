@@ -7,8 +7,8 @@
 
 use std::fs::File;
 use std::io::{Read as _, Write as _};
-use std::path::{Path, PathBuf};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
@@ -56,7 +56,13 @@ fn tools_hash() -> String {
 
 /// Everything the running builder depends on; a change recreates it.
 fn spec() -> String {
-    util::fingerprint(&[store::IMAGE, &PORT.to_string(), NIX_CONFIG, START, &tools_hash()])
+    util::fingerprint(&[
+        store::IMAGE,
+        &PORT.to_string(),
+        NIX_CONFIG,
+        START,
+        &tools_hash(),
+    ])
 }
 
 /// Make sure the store is attached and a healthy, current builder serves it.
@@ -100,13 +106,15 @@ fn lock() -> Result<File> {
 /// Stale DNS recreates it too: nobody works in the builder, so that costs at
 /// most a nix build in progress, while stale DNS fails every download.
 fn stale(handle: &SandboxHandle) -> Result<Option<&'static str>> {
-    Ok(if util::label(handle, "bento.spec").as_deref() != Some(spec().as_str()) {
-        Some("bento changed")
-    } else if util::dns_stale(&dns_file()?) {
-        Some("network changed")
-    } else {
-        None
-    })
+    Ok(
+        if util::label(handle, "bento.spec").as_deref() != Some(spec().as_str()) {
+            Some("bento changed")
+        } else if util::dns_stale(&dns_file()?) {
+            Some("network changed")
+        } else {
+            None
+        },
+    )
 }
 
 /// The builder's status for `bento ls`, with why the next bento command will

@@ -48,7 +48,11 @@ pub struct Forest {
 impl Forest {
     /// Quota for the forest-wide binds (the /workspace root).
     pub fn quota_mib(&self) -> u32 {
-        self.trees.iter().map(|t| t.quota_mib).max().unwrap_or(DEFAULT_QUOTA_GIB * 1024)
+        self.trees
+            .iter()
+            .map(|t| t.quota_mib)
+            .max()
+            .unwrap_or(DEFAULT_QUOTA_GIB * 1024)
     }
 }
 
@@ -80,7 +84,9 @@ pub fn discover() -> Result<Forest> {
             break;
         }
         if !dir.pop() {
-            bail!("not inside a git checkout (no .git or bento.yaml in this directory or any parent)");
+            bail!(
+                "not inside a git checkout (no .git or bento.yaml in this directory or any parent)"
+            );
         }
     }
     let tree = tree_at(dir.clone(), None)?;
@@ -107,7 +113,9 @@ fn is_workforest(dir: &Path) -> bool {
         return false;
     };
     forests.file_name().is_some_and(|n| n == FORESTS)
-        && forests.parent().is_some_and(|root| root.join(REPOS).is_dir())
+        && forests
+            .parent()
+            .is_some_and(|root| root.join(REPOS).is_dir())
 }
 
 /// A workforest: its trees are the checkouts directly in it. Forest and
@@ -215,7 +223,11 @@ fn load_config(dir: &Path) -> Result<Config> {
     if let Some(gib) = cfg.quota_gib {
         // msb takes MiB as u32
         if gib == 0 || gib > u32::MAX / 1024 {
-            bail!("{}: quota_gib must be 1..={}", path.display(), u32::MAX / 1024);
+            bail!(
+                "{}: quota_gib must be 1..={}",
+                path.display(),
+                u32::MAX / 1024
+            );
         }
     }
     Ok(cfg)
@@ -283,7 +295,12 @@ fn truncate(s: &str, max: usize) -> &str {
 }
 
 pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output().ok()?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }

@@ -31,7 +31,9 @@ pub fn disk_usage(path: &Path) -> Result<u64> {
     };
     let mut total = meta.blocks() * 512;
     if meta.is_dir() {
-        for entry in std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))? {
+        for entry in
+            std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
+        {
             total += disk_usage(&entry?.path())?;
         }
     }

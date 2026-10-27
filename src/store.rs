@@ -51,7 +51,10 @@ fn ensure_attached() -> Result<PathBuf> {
     let image = image()?;
     let mnt = dir.join("store");
     if !image.exists() {
-        println!("store: creating {} (case-sensitive APFS, max {SIZE})", image.display());
+        println!(
+            "store: creating {} (case-sensitive APFS, max {SIZE})",
+            image.display()
+        );
         hdiutil(&[
             "create",
             "-size",
