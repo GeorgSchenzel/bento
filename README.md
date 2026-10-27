@@ -179,5 +179,5 @@ nix develop --no-pure-eval   # same environment as `devenv shell`
 ```
 
 Bumping the `microsandbox` crate means updating the release hashes in
-`flake.nix`. Design notes and their evidence: `docs/handoff-shared-store.md`
+`nix/package.nix`. Design notes and their evidence: `docs/handoff-shared-store.md`
 and the `experiments/shared-store` branch.
