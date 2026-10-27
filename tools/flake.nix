@@ -34,6 +34,7 @@
               devenv # boxes run in the checkout's devenv shell
               docker # dockerd runs in every box; includes compose and buildx
               git
+              just # the agents' guide points at justfiles
               socat
               ncurses # terminfo for the host's TERM
             ];

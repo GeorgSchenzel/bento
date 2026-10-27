@@ -79,7 +79,9 @@ the old box and its state (agent history included) are left behind;
 
 `git commit` works in every checkout and lands in the host repo.
 `/workspace` itself is box-owned (`boxes/<box>/root` on the host), so files
-written there stay out of the host forest dir.
+written there stay out of the host forest dir. Bento writes a short guide to
+the box for the agents there, as `CLAUDE.md` and `AGENTS.md`: what's live on
+the host, the checkouts and their branches, devenv, `just`, nix and docker.
 
 ### Agents
 
@@ -155,7 +157,7 @@ bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:
 
 - The builder is the only process that writes to the store. Locks don't
   work across microsandbox VMs, so two VMs writing the same store corrupt it.
-- The box tools (claude-code, opencode, devenv, docker, git, socat, ncurses) come from a
+- The box tools (claude-code, opencode, devenv, docker, git, just, socat, ncurses) come from a
   flake that is embedded in the binary (`tools/`). The builder builds it
   into the GC root `/nix/var/nix/gcroots/bento/tools`, and boxes have its
   `bin/` on PATH. Changing the flake rebuilds the tools on the next command.

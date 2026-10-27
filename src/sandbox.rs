@@ -105,6 +105,7 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
         Mount::rw(WORKDIR, &root, forest.quota_mib()),
     ];
     remove_combined_devenv(&root)?;
+    write_guide(forest, &root)?;
     for tree in &forest.trees {
         let quota = tree.quota_mib;
         let guest = format!("{WORKDIR}/{}", tree.name);
@@ -151,6 +152,51 @@ fn remove_combined_devenv(root: &Path) -> Result<()> {
             }
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// The agents' guide to the box, at /workspace (CLAUDE.md and AGENTS.md,
+/// picked up from parent dirs). Rewritten on every connect, so the
+/// checkouts' branches stay current.
+fn write_guide(forest: &Forest, root: &Path) -> Result<()> {
+    let mut checkouts = String::new();
+    for tree in &forest.trees {
+        let branch = forest::git(&tree.dir, &["branch", "--show-current"])
+            .unwrap_or_else(|| "detached".into());
+        checkouts.push_str(&format!("- `{WORKDIR}/{}` ({branch})\n", tree.name));
+    }
+    let other = if forest.trees.len() > 1 {
+        " Your\n  shell has the one you started in; for another checkout run\n  \
+         `cd /workspace/<project> && devenv shell -- <cmd>`."
+    } else {
+        ""
+    };
+    let text = format!(
+        "# Workspace
+
+You are in a sandbox: a Linux VM (aarch64) on the user's macOS machine,
+running as root with full network access. Experiment freely.
+
+## Checkouts
+
+{checkouts}
+These are the user's live files: edits show up on their machine right away,
+and `git commit` lands in their repo. `git push` doesn't work; leave that to
+the user. Files outside the checkouts never leave the box.
+
+## Tools
+
+- Each checkout with a `devenv.nix` has its tools in its devenv shell.{other}
+  A first activation can take minutes.
+- If a checkout has a `justfile`, run `just` to see its recipes and prefer
+  them.
+- Anything else: `nix shell nixpkgs#<pkg> -c <cmd>`.
+- Docker works.
+"
+    );
+    for name in ["CLAUDE.md", "AGENTS.md"] {
+        write(root, name, &text)?;
     }
     Ok(())
 }
