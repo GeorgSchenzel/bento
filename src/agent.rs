@@ -93,10 +93,15 @@ impl Agent {
 /// Sandbox-wide env for the agents.
 pub fn sandbox_env(home: &Path) -> Vec<(String, String)> {
     // puts .claude.json inside the per-box state dir instead of $HOME
-    vec![(
-        "CLAUDE_CONFIG_DIR".into(),
-        home.join(".claude").display().to_string(),
-    )]
+    vec![
+        (
+            "CLAUDE_CONFIG_DIR".into(),
+            home.join(".claude").display().to_string(),
+        ),
+        // claude refuses --dangerously-skip-permissions as root (the box's
+        // user) unless it knows it's in a sandbox already
+        ("IS_SANDBOX".into(), "1".into()),
+    ]
 }
 
 /// Agent state and config mounts. `state` is the box's host state dir.

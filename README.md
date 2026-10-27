@@ -94,7 +94,8 @@ Plugins that call host-only binaries won't work in the box.
 
 - **claude** and **opencode** run permission-free: bento passes
   `--dangerously-skip-permissions` / `--auto`, skipped when you pass your own
-  permission flag. The box is the sandbox.
+  permission flag. The box is the sandbox, and the box-wide `IS_SANDBOX=1`
+  lets claude run permission-free as root.
 - **opencode** uses the host's `~/.local/share/opencode/auth.json`
   (read-only).
 - **claude** can't use the host login (it lives in the macOS Keychain).
