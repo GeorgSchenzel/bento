@@ -92,6 +92,9 @@ paths in that config still resolve. Agent state (history, sessions, the
 opencode db) is kept per box in `~/.local/share/bento/boxes/<box>/`.
 Plugins that call host-only binaries won't work in the box.
 
+- **claude** and **opencode** run permission-free: bento passes
+  `--dangerously-skip-permissions` / `--auto`, skipped when you pass your own
+  permission flag. The box is the sandbox.
 - **opencode** uses the host's `~/.local/share/opencode/auth.json`
   (read-only).
 - **claude** can't use the host login (it lives in the macOS Keychain).
@@ -157,7 +160,7 @@ bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:
 
 - The builder is the only process that writes to the store. Locks don't
   work across microsandbox VMs, so two VMs writing the same store corrupt it.
-- The box tools (claude-code, opencode, devenv, docker, git, just, socat, ncurses) come from a
+- The box tools (claude-code, opencode, devenv, docker, git, just, python3, uv, socat, ncurses) come from a
   flake that is embedded in the binary (`tools/`). The builder builds it
   into the GC root `/nix/var/nix/gcroots/bento/tools`, and boxes have its
   `bin/` on PATH. Changing the flake rebuilds the tools on the next command.

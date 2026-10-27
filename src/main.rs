@@ -150,7 +150,14 @@ async fn run_agent(agent: Agent, args: &[String]) -> Result<u8> {
         }
     }
     env.extend(util::term_env());
-    util::attach(&sb, agent.command(), args, &forest.cwd, env).await
+    util::attach(
+        &sb,
+        agent.command(),
+        &agent.launch_args(args),
+        &forest.cwd,
+        env,
+    )
+    .await
 }
 
 fn need_tty(what: &str) -> Result<()> {

@@ -35,6 +35,8 @@
               docker # dockerd runs in every box; includes compose and buildx
               git
               just # the agents' guide points at justfiles
+              python3 # agents shell out to python3
+              uv # python projects and tools
               socat
               ncurses # terminfo for the host's TERM
             ];

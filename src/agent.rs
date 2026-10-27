@@ -41,6 +41,32 @@ impl Agent {
         }
     }
 
+    /// Launch args: the user's args with a permission-skipping flag in
+    /// front, unless they set permissions themselves. The box is the
+    /// sandbox, so agents run permission-free.
+    pub fn launch_args(&self, args: &[String]) -> Vec<String> {
+        const PERMISSIONS: &[&str] = &[
+            "--dangerously-skip-permissions",
+            "--permission-mode",
+            "--auto",
+            "--yolo",
+        ];
+        if args.iter().any(|a| {
+            PERMISSIONS
+                .iter()
+                .any(|p| a == p || a.starts_with(&format!("{p}=")))
+        }) {
+            return args.to_vec();
+        }
+        let flag = match self {
+            Agent::Claude => "--dangerously-skip-permissions",
+            Agent::Opencode => "--auto",
+        };
+        std::iter::once(flag.to_string())
+            .chain(args.iter().cloned())
+            .collect()
+    }
+
     /// Per-run env (credentials stay out of the sandbox config).
     pub fn env(&self, home: &Path) -> Result<Vec<(String, String)>> {
         match self {
