@@ -99,6 +99,55 @@ pub fn term_env() -> Vec<(String, String)> {
     env
 }
 
+/// The host's primary DNS servers: what msb forwards a sandbox's DNS to. msb
+/// reads them (macOS dynamic store) once, when the sandbox boots, so after a
+/// network change a running sandbox keeps asking the old network's servers
+/// and name lookups fail. None when they can't be read.
+pub fn host_dns() -> Option<String> {
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("scutil")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    child
+        .stdin
+        .take()?
+        .write_all(b"show State:/Network/Global/DNS\n")
+        .ok()?;
+    let out = child.wait_with_output().ok()?;
+    // ServerAddresses : <array> {
+    //   0 : 10.10.10.1
+    // }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let servers: Vec<&str> = text
+        .lines()
+        .skip_while(|l| !l.contains("ServerAddresses"))
+        .skip(1)
+        .take_while(|l| l.trim() != "}")
+        .filter_map(|l| l.split_once(" : ").map(|(_, addr)| addr.trim()))
+        .collect();
+    (!servers.is_empty()).then(|| servers.join(" "))
+}
+
+/// Remember the host DNS a sandbox booted with (see `host_dns`).
+pub fn record_dns(path: &Path) {
+    let _ = match host_dns() {
+        Some(dns) => std::fs::write(path, dns),
+        None => std::fs::remove_file(path),
+    };
+}
+
+/// The host DNS changed since the sandbox recorded at `path` booted: its DNS
+/// is stale until it is restarted.
+pub fn dns_stale(path: &Path) -> bool {
+    match (std::fs::read_to_string(path), host_dns()) {
+        (Ok(booted), Some(now)) => booted != now,
+        _ => false,
+    }
+}
+
 /// Label value of an existing sandbox, if any.
 pub fn label(handle: &microsandbox::sandbox::SandboxHandle, key: &str) -> Option<String> {
     handle.config().ok()?.spec.labels.get(key).cloned()

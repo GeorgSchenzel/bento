@@ -45,13 +45,22 @@ enum Command {
         args: Vec<String>,
     },
     #[command(about = "Open a shell in the builder (owner of the shared nix store)")]
-    Builder,
+    Builder {
+        #[command(subcommand)]
+        action: Option<BuilderAction>,
+    },
     #[command(about = "Remove the box for this checkout or forest and its state")]
     Rm,
-    #[command(about = "List the boxes with their status and checkout or forest")]
+    #[command(about = "List the builder and the boxes with their status, disk use and checkout or forest")]
     Ls,
     #[command(about = "Remove the boxes whose checkout or forest is gone, and their state")]
     Prune,
+}
+
+#[derive(Debug, Subcommand)]
+enum BuilderAction {
+    #[command(about = "Recreate the builder (cuts off nix builds in progress)")]
+    Restart,
 }
 
 #[tokio::main]
@@ -86,9 +95,15 @@ async fn run(command: Command) -> Result<u8> {
     }
     match command {
         Command::Install => unreachable!(),
-        Command::Builder => {
+        Command::Builder { action: None } => {
             need_tty("bento builder")?;
             builder::enter().await
+        }
+        Command::Builder {
+            action: Some(BuilderAction::Restart),
+        } => {
+            builder::restart().await?;
+            Ok(0)
         }
         Command::Start => {
             sandbox::create(&forest::discover()?).await?;

@@ -12,7 +12,8 @@ use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
-use microsandbox::sandbox::Sandbox;
+use microsandbox::sandbox::{Sandbox, SandboxHandle};
+use microsandbox::MicrosandboxError;
 
 use crate::{store, util};
 
@@ -59,27 +60,65 @@ fn spec() -> String {
 }
 
 /// Make sure the store is attached and a healthy, current builder serves it.
-/// Holds a host lock so concurrent bento commands don't race to recreate it.
 pub async fn ensure() -> Result<PathBuf> {
-    let lock_path = util::data_dir()?.join("builder.lock");
-    let lock = File::create(&lock_path).with_context(|| format!("opening {}", lock_path.display()))?;
-    lock.lock().context("locking the builder")?;
-
+    let _lock = lock()?;
     let nix = store::ensure().await?;
-    let spec = spec();
     if let Ok(handle) = Sandbox::get(NAME).await {
-        let reason = if util::label(&handle, "bento.spec").as_deref() != Some(spec.as_str()) {
-            "bento changed"
-        } else if healthy() {
-            return Ok(nix);
-        } else {
-            "daemon not answering"
+        let reason = match stale(&handle)? {
+            Some(reason) => reason,
+            None if !healthy() => "daemon not answering",
+            None => return Ok(nix),
         };
         println!("builder: recreating ({reason})");
         util::remove_sandbox(NAME).await?;
     }
-    create(&nix, &spec).await?;
+    create(&nix, &spec()).await?;
     Ok(nix)
+}
+
+/// Recreate the builder on request. Cuts off nix builds in progress; boxes
+/// reconnect on their next nix command.
+pub async fn restart() -> Result<()> {
+    let _lock = lock()?;
+    let nix = store::ensure().await?;
+    if util::remove_sandbox(NAME).await? {
+        println!("builder: removed");
+    }
+    create(&nix, &spec()).await
+}
+
+/// A host lock, so concurrent bento commands don't race to recreate the
+/// builder; held until dropped.
+fn lock() -> Result<File> {
+    let path = util::data_dir()?.join("builder.lock");
+    let lock = File::create(&path).with_context(|| format!("opening {}", path.display()))?;
+    lock.lock().context("locking the builder")?;
+    Ok(lock)
+}
+
+/// Why the existing builder is due for recreation (health aside), if it is.
+/// Stale DNS recreates it too: nobody works in the builder, so that costs at
+/// most a nix build in progress, while stale DNS fails every download.
+fn stale(handle: &SandboxHandle) -> Result<Option<&'static str>> {
+    Ok(if util::label(handle, "bento.spec").as_deref() != Some(spec().as_str()) {
+        Some("bento changed")
+    } else if util::dns_stale(&dns_file()?) {
+        Some("network changed")
+    } else {
+        None
+    })
+}
+
+/// The builder's status for `bento ls`, with why the next bento command will
+/// recreate it, if it will; None when there is no builder.
+pub async fn status() -> Result<Option<(String, Option<&'static str>)>> {
+    let handle = match Sandbox::get(NAME).await {
+        Ok(handle) => handle,
+        Err(MicrosandboxError::SandboxNotFound(_)) => return Ok(None),
+        Err(err) => return Err(err).context("looking up the builder"),
+    };
+    let status = format!("{:?}", handle.status_snapshot()).to_lowercase();
+    Ok(Some((status, stale(&handle)?)))
 }
 
 async fn create(nix: &Path, spec: &str) -> Result<()> {
@@ -100,6 +139,7 @@ async fn create(nix: &Path, spec: &str) -> Result<()> {
         .create_detached()
         .await
         .context("creating the builder")?;
+    util::record_dns(&dns_file()?);
     sb.shell("mkdir -p /bento/flake").await?;
     sb.fs().write("/bento/flake/flake.nix", FLAKE).await?;
     sb.fs().write("/bento/flake/flake.lock", FLAKE_LOCK).await?;
@@ -116,6 +156,11 @@ async fn create(nix: &Path, spec: &str) -> Result<()> {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     bail!("builder: nix-daemon does not answer on 127.0.0.1:{PORT} (see /tmp/nix-daemon.log via `bento builder`)")
+}
+
+/// The host DNS the builder booted with.
+fn dns_file() -> Result<PathBuf> {
+    Ok(util::data_dir()?.join("builder.dns"))
 }
 
 /// The daemon answers the nix worker handshake on the published port. A bare

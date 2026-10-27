@@ -20,7 +20,7 @@ pub const IMAGE: &str =
     "mirror.gcr.io/nixos/nix@sha256:ff480dbb23511aa1c10710aa068ceea5b93fed9bfce5f5379f3a6b07282cbc7b";
 
 /// Sparse: the image only takes the space the store uses, up to this cap.
-const SIZE: &str = "60g";
+pub const SIZE: &str = "60g";
 
 const SEED_BOX: &str = "bento-seed";
 
@@ -35,9 +35,20 @@ pub async fn ensure() -> Result<PathBuf> {
     Ok(nix)
 }
 
+/// The sparse image holding the store.
+pub fn image() -> Result<PathBuf> {
+    Ok(util::data_dir()?.join("store.sparseimage"))
+}
+
+/// Host disk the store takes (the image's allocated size; nix-collect-garbage
+/// in the builder frees space inside it, not on the host).
+pub fn usage() -> Result<u64> {
+    util::disk_usage(&image()?)
+}
+
 fn ensure_attached() -> Result<PathBuf> {
     let dir = util::data_dir()?;
-    let image = dir.join("store.sparseimage");
+    let image = image()?;
     let mnt = dir.join("store");
     if !image.exists() {
         println!("store: creating {} (case-sensitive APFS, max {SIZE})", image.display());

@@ -251,6 +251,7 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
         .create_detached()
         .await
         .with_context(|| format!("creating box '{}'", forest.name))?;
+    util::record_dns(&state.join("host-dns"));
     services(&sb).await?;
     Ok(sb)
 }
@@ -279,6 +280,9 @@ pub async fn ensure_running(forest: &Forest) -> Result<Sandbox> {
             if !current {
                 println!("warning: box config changed (bento.yaml, agent config or bento itself); run `bento start` to apply");
             }
+            if util::dns_stale(&state.join("host-dns")) {
+                println!("warning: host network changed since the box started, so its DNS fails; run `bento start` to fix (restarts the box)");
+            }
             sb
         }
         Err(MicrosandboxError::SandboxNotRunning(_)) if !current => {
@@ -287,10 +291,12 @@ pub async fn ensure_running(forest: &Forest) -> Result<Sandbox> {
         }
         Err(MicrosandboxError::SandboxNotRunning(_)) => {
             println!("box '{}': starting", forest.name);
-            handle
+            let sb = handle
                 .start_detached()
                 .await
-                .with_context(|| format!("starting box '{}'", forest.name))?
+                .with_context(|| format!("starting box '{}'", forest.name))?;
+            util::record_dns(&state.join("host-dns"));
+            sb
         }
         Err(err) => return Err(err).with_context(|| format!("connecting to box '{}'", forest.name)),
     };
@@ -382,23 +388,38 @@ async fn boxes() -> Result<Vec<(SandboxHandle, String)>> {
     Ok(boxes)
 }
 
-/// Print every box with its status, disk use and the checkout or forest it
-/// belongs to.
+/// Print the builder with the store's disk use, then every box with its
+/// status, disk use and the checkout or forest it belongs to. A status notes
+/// why the box or builder is due for a restart: a box's with `bento start`,
+/// the builder's happens by itself on the next bento command.
 pub async fn ls() -> Result<()> {
-    let boxes = boxes().await?;
-    if boxes.is_empty() {
-        println!("no boxes");
-        return Ok(());
-    }
     let mut rows = Vec::new();
-    for (handle, path) in &boxes {
-        let status = format!("{:?}", handle.status_snapshot()).to_lowercase();
+    let store = store::image()?;
+    if store.exists() {
+        let status = match builder::status().await? {
+            Some((status, Some(stale))) => format!("{status} ({stale})"),
+            Some((status, None)) => status,
+            None => "absent".into(),
+        };
+        let size = store::usage().map_or("?".into(), util::human_bytes);
+        let path = format!("{} (nix store, max {})", store.display(), store::SIZE);
+        rows.push((builder::NAME.to_string(), status, size, path));
+    }
+    for (handle, path) in &boxes().await? {
+        let mut status = format!("{:?}", handle.status_snapshot()).to_lowercase();
+        if status == "running" && util::dns_stale(&box_state_dir(handle.name())?.join("host-dns")) {
+            status.push_str(" (network changed)");
+        }
         let size = match size(handle.name()).await {
             Ok(bytes) => util::human_bytes(bytes),
             Err(_) => "?".into(),
         };
         let gone = if Path::new(path).exists() { "" } else { " (gone)" };
         rows.push((handle.name().to_string(), status, size, format!("{path}{gone}")));
+    }
+    if rows.is_empty() {
+        println!("no boxes");
+        return Ok(());
     }
     let name_w = rows.iter().map(|r| r.0.len()).max().unwrap_or(0).max(4);
     let status_w = rows.iter().map(|r| r.1.len()).max().unwrap_or(0).max(6);
