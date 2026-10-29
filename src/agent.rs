@@ -25,7 +25,9 @@ const CLAUDE_CONFIG: &[&str] = &[
 ];
 
 /// Long-lived token from `claude setup-token`: the host's claude credentials
-/// live in the macOS Keychain, which can't be mounted.
+/// live in the macOS Keychain, which can't be mounted. The host env var wins
+/// over the file, so the shell decides which account a run uses.
+const CLAUDE_TOKEN_VAR: &str = "BENTO_CLAUDE_TOKEN";
 const CLAUDE_TOKEN: &str = ".config/bento/claude-token";
 
 pub enum Agent {
@@ -71,13 +73,18 @@ impl Agent {
     pub fn env(&self, home: &Path) -> Result<Vec<(String, String)>> {
         match self {
             Agent::Claude => {
-                let path = home.join(CLAUDE_TOKEN);
-                let token = fs::read_to_string(&path).with_context(|| {
-                    format!(
-                        "reading the claude token {}; create it with:\n  claude setup-token  # then save the printed token to that file",
-                        path.display()
-                    )
-                })?;
+                let token = match std::env::var(CLAUDE_TOKEN_VAR) {
+                    Ok(token) if !token.trim().is_empty() => token,
+                    _ => {
+                        let path = home.join(CLAUDE_TOKEN);
+                        fs::read_to_string(&path).with_context(|| {
+                            format!(
+                                "no claude token: set {CLAUDE_TOKEN_VAR}, or save one to {}; create it with:\n  claude setup-token",
+                                path.display()
+                            )
+                        })?
+                    }
+                };
                 Ok(vec![
                     ("CLAUDE_CODE_OAUTH_TOKEN".into(), token.trim().to_string()),
                     // The fullscreen TUI is gated by an account feature flag,

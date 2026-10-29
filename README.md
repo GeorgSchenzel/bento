@@ -107,6 +107,10 @@ Plugins that call host-only binaries won't work in the box.
   chmod 600 ~/.config/bento/claude-token
   ```
 
+  Or set `BENTO_CLAUDE_TOKEN` on the host, which takes precedence over the
+  file. Switch accounts by setting it per run:
+  `BENTO_CLAUDE_TOKEN=$WORK_TOKEN bento claude`.
+
 ### devenv
 
 `enter`, `claude` and `opencode` run inside the `devenv shell` of the
