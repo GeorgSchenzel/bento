@@ -3,7 +3,9 @@
 //! boxes); the host's agent config is layered on top read-only, so the box
 //! sees the same plugins/skills/settings but can't modify them.
 
+use std::ffi::OsString;
 use std::fs;
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context as _, Result};
@@ -168,6 +170,71 @@ fn canonical(path: &Path) -> Option<PathBuf> {
     fs::canonicalize(path).ok()
 }
 
+/// Files in the state dir that outlive the box, besides claude's session
+/// transcripts. The db's WAL can hold its latest messages.
+const ARCHIVED: &[&str] = &[
+    "claude/history.jsonl",
+    "opencode/opencode.db",
+    "opencode/opencode.db-wal",
+];
+
+/// Move the chats out of a stopped box's state dir into `dest`, created only
+/// if there are any. The guest wrote that dir: symlinks in it are never
+/// followed or kept, or a box could have host files moved here. Whatever a
+/// failed run already moved is simply missing on retry.
+pub fn archive(state: &Path, dest: &Path) -> Result<()> {
+    let mut chats: Vec<PathBuf> = ARCHIVED.iter().map(PathBuf::from).collect();
+    chats.extend(claude_transcripts(state)?);
+    for chat in chats {
+        let from = state.join(&chat);
+        if !fs::symlink_metadata(&from).is_ok_and(|m| m.is_file()) {
+            continue;
+        }
+        let to = dest.join(&chat);
+        let parent = to.parent().context("archived file without a parent")?;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700) // transcripts and the db hold secrets
+            .create(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
+        fs::rename(&from, &to)
+            .with_context(|| format!("moving {} to {}", from.display(), to.display()))?;
+    }
+    Ok(())
+}
+
+/// `claude/projects/<project>/<session>.jsonl`, relative to the state dir;
+/// not the tool-results, subagents and memory dirs beside them.
+fn claude_transcripts(state: &Path) -> Result<Vec<PathBuf>> {
+    let projects = Path::new("claude/projects");
+    let mut transcripts = Vec::new();
+    for project in real_entries(&state.join(projects), fs::Metadata::is_dir)? {
+        let project = projects.join(project);
+        for file in real_entries(&state.join(&project), fs::Metadata::is_file)? {
+            if Path::new(&file).extension().is_some_and(|e| e == "jsonl") {
+                transcripts.push(project.join(file));
+            }
+        }
+    }
+    Ok(transcripts)
+}
+
+/// Names of a dir's entries that pass `keep`, without following symlinks; a
+/// dir that's missing or a symlink has none.
+fn real_entries(dir: &Path, keep: fn(&fs::Metadata) -> bool) -> Result<Vec<OsString>> {
+    if !fs::symlink_metadata(dir).is_ok_and(|m| m.is_dir()) {
+        return Ok(Vec::new());
+    }
+    let mut names = Vec::new();
+    for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+        let entry = entry.with_context(|| format!("reading {}", dir.display()))?;
+        if fs::symlink_metadata(entry.path()).is_ok_and(|m| keep(&m)) {
+            names.push(entry.file_name());
+        }
+    }
+    Ok(names)
+}
+
 /// opencode v2 keeps credentials in its sqlite db. It imports the v1
 /// auth.json only when migrating a v1 db, never into a fresh one, so a box
 /// would start without any. Hand the host's keys over with `opencode auth
@@ -225,4 +292,112 @@ fn opencode_credentials(home: &Path) -> Result<Option<String>> {
         }));
     }
     Ok((!entries.is_empty()).then(|| Value::Array(entries).to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+    fn write(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, "x").unwrap();
+    }
+
+    fn tmp(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("bento-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn archives_only_the_chats() {
+        let root = tmp("whitelist");
+        let (state, dest) = (root.join("state"), root.join("dest"));
+        for kept in [
+            "claude/history.jsonl",
+            "claude/projects/p/s.jsonl",
+            "opencode/opencode.db",
+            "opencode/opencode.db-wal",
+        ] {
+            write(&state.join(kept));
+        }
+        for dropped in [
+            "claude/.claude.json",
+            "claude/file-history/s/f",
+            "claude/projects/p/s/tool-results/t.jsonl",
+            "claude/projects/p/s/subagents/a.jsonl",
+            "claude/projects/p/memory/m.md",
+            "opencode/opencode.db-shm",
+            "opencode/snapshot/h/f",
+            "opencode/log/l",
+        ] {
+            write(&state.join(dropped));
+        }
+        archive(&state, &dest).unwrap();
+        assert!(dest.join("claude/history.jsonl").is_file());
+        assert!(dest.join("claude/projects/p/s.jsonl").is_file());
+        assert!(dest.join("opencode/opencode.db").is_file());
+        assert!(dest.join("opencode/opencode.db-wal").is_file());
+        assert!(!state.join("opencode/opencode.db").exists());
+        assert!(!dest.join("claude/projects/p/s").exists());
+        assert!(!dest.join("claude/projects/p/memory").exists());
+        assert!(!dest.join("opencode/snapshot").exists());
+        assert!(!dest.join("opencode/opencode.db-shm").exists());
+        assert!(!dest.join("claude/.claude.json").exists());
+        assert_eq!(
+            fs::metadata(dest.join("claude"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn never_touches_what_guest_symlinks_point_at() {
+        let root = tmp("symlinks");
+        let (state, dest, host) = (root.join("state"), root.join("dest"), root.join("host"));
+        write(&host.join("p/secret.jsonl"));
+        write(&host.join("secret.jsonl"));
+        fs::create_dir_all(state.join("claude")).unwrap();
+        fs::create_dir_all(state.join("opencode")).unwrap();
+        // the projects dir, a project and a transcript, and a fixed path
+        symlink(&host, state.join("claude/projects")).unwrap();
+        symlink(
+            host.join("secret.jsonl"),
+            state.join("opencode/opencode.db"),
+        )
+        .unwrap();
+        archive(&state, &dest).unwrap();
+        assert!(host.join("p/secret.jsonl").is_file());
+        assert!(host.join("secret.jsonl").is_file());
+        assert!(!dest.exists());
+
+        fs::remove_file(state.join("claude/projects")).unwrap();
+        fs::create_dir_all(state.join("claude/projects/real")).unwrap();
+        symlink(host.join("p"), state.join("claude/projects/link")).unwrap();
+        symlink(
+            host.join("secret.jsonl"),
+            state.join("claude/projects/real/s.jsonl"),
+        )
+        .unwrap();
+        archive(&state, &dest).unwrap();
+        assert!(host.join("p/secret.jsonl").is_file());
+        assert!(host.join("secret.jsonl").is_file());
+        assert!(!dest.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn nothing_to_archive_creates_nothing() {
+        let root = tmp("empty");
+        let dest = root.join("dest");
+        archive(&root.join("missing"), &dest).unwrap();
+        assert!(!dest.exists());
+        fs::remove_dir_all(&root).unwrap();
+    }
 }

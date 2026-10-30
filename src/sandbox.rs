@@ -5,6 +5,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context as _, Result};
 use microsandbox::sandbox::{HostPermissions, Sandbox, SandboxHandle, StatVirtualization};
@@ -580,9 +581,26 @@ pub async fn prune() -> Result<()> {
     Ok(())
 }
 
-/// Remove a box and its state dir; returns the bytes freed, or None when
-/// they could not be measured (removal goes ahead regardless).
+/// Stop a box and archive its agent chats. This comes before removing the
+/// sandbox, so a failure leaves the box listed and `prune` can retry.
+async fn archive_chats(name: &str) -> Result<()> {
+    if let Ok(handle) = Sandbox::get(name).await {
+        // stopping an already stopped sandbox fails
+        let _ = handle.stop().await;
+    }
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs();
+    let dest = util::data_dir()?
+        .join("archive")
+        .join(format!("{name}-{now}"));
+    agent::archive(&box_state_dir(name)?, &dest)
+        .with_context(|| format!("archiving the chats of box '{name}', not removing it"))
+}
+
+/// Remove a box and its state dir, keeping its chats; returns the bytes
+/// freed, or None when they could not be measured (removal goes ahead
+/// regardless).
 async fn remove(name: &str) -> Result<Option<u64>> {
+    archive_chats(name).await?;
     let freed = match size(name).await {
         Ok(bytes) => Some(bytes),
         Err(e) => {

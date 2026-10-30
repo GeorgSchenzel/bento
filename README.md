@@ -57,7 +57,7 @@ bento claude     # claude in the box (args are passed through)
 bento opencode   # opencode in the box (args are passed through)
 bento start      # (re)create the box, applying config changes
 bento stop       # stop the box (the builder keeps running)
-bento rm         # remove the box and its state
+bento rm         # remove the box and its state, archiving its chats
 bento ls         # list the boxes: status, disk use, checkout or forest (gone ones marked)
 bento prune      # remove the boxes whose checkout or forest is gone
 bento builder    # bash in the builder VM
@@ -79,7 +79,7 @@ forest root (or the checkout itself, in a forest of one).
 
 Boxes are keyed by path: after `forest rm`, `forest clean` or `forest mv`
 the old box and its state (agent history included) are left behind;
-`bento prune` removes them.
+`bento prune` removes them, archiving the chats.
 
 `git commit` works in every checkout and lands in the host repo.
 `/workspace` itself is box-owned (`boxes/<box>/root` on the host), so files
@@ -95,6 +95,13 @@ CLAUDE.md,skills,plugins,agents,commands}` and everything in
 paths in that config still resolve. Agent state (history, sessions, the
 opencode db) is kept per box in `~/.local/share/bento/boxes/<box>/`.
 Plugins that call host-only binaries won't work in the box.
+
+`bento rm` and `bento prune` first move the box's chats to
+`~/.local/share/bento/archive/<box>-<unix time>/`, and leave the box alone if
+that fails. They keep claude's `history.jsonl` and session transcripts, and
+opencode's db and its WAL. These hold tool output inline and the db holds
+opencode's API keys in plaintext, so the archive is `0700`. Nothing cleans it
+up.
 
 - **claude** and **opencode** run permission-free: bento passes
   `--dangerously-skip-permissions` / `--auto`, skipped when you pass your own
