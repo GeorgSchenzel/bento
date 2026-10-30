@@ -7,7 +7,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use microsandbox::sandbox::{Sandbox, SandboxHandle};
+use microsandbox::sandbox::{HostPermissions, Sandbox, SandboxHandle, StatVirtualization};
 use microsandbox::{MicrosandboxError, NetworkPolicy, NetworkProfile};
 use microsandbox_image::ext4::{format_ext4, Ext4FormatOptions};
 
@@ -38,6 +38,8 @@ pub struct Mount {
 enum MountKind {
     Ro,
     Rw(u32),
+    /// Rw for the host's live files, see [`Mount::live`].
+    Live(u32),
     Disk,
 }
 
@@ -55,6 +57,18 @@ impl Mount {
             guest: guest.as_ref().display().to_string(),
             host: host.into(),
             kind: MountKind::Rw(quota_mib),
+        }
+    }
+
+    /// A writable bind of files the host works with too: checkouts and their
+    /// git dirs. On Linux msb's default keeps guest symlinks and modes in
+    /// xattrs, so the host would see symlinks as regular files, no exec bits,
+    /// and a dirty `git status`.
+    fn live(guest: impl AsRef<Path>, host: impl Into<PathBuf>, quota_mib: u32) -> Self {
+        Mount {
+            guest: guest.as_ref().display().to_string(),
+            host: host.into(),
+            kind: MountKind::Live(quota_mib),
         }
     }
 
@@ -115,10 +129,10 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
     for tree in &forest.trees {
         let quota = tree.quota_mib;
         let guest = format!("{WORKDIR}/{}", tree.name);
-        mounts.push(Mount::rw(&guest, &tree.dir, quota));
+        mounts.push(Mount::live(&guest, &tree.dir, quota));
         // Box-local copies of platform-specific dirs: the tree bind is
-        // shadowed per entry by a twin in the state dir, so host (macOS) and
-        // box (linux) build artifacts never mix.
+        // shadowed per entry by a twin in the state dir, so host and box
+        // build artifacts never mix.
         for entry in &tree.overlays {
             let host = state.join("ov").join(&tree.name).join(entry);
             fs::create_dir_all(&host).with_context(|| format!("creating {}", host.display()))?;
@@ -140,7 +154,7 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
                 &format!("gitdir-back-{}", tree.name),
                 &format!("{guest}/.git\n"),
             )?;
-            mounts.push(Mount::rw(&git, &wt.main_git, quota));
+            mounts.push(Mount::live(&git, &wt.main_git, quota));
             mounts.push(Mount::ro(format!("{guest}/.git"), pointer));
             mounts.push(Mount::ro(
                 format!("{git}/worktrees/{}/gitdir", wt.wt_id),
@@ -191,10 +205,16 @@ fn write_guide(forest: &Forest, root: &Path) -> Result<()> {
     } else {
         ""
     };
+    let arch = std::env::consts::ARCH;
+    let host = if cfg!(target_os = "macos") {
+        "macOS"
+    } else {
+        "Linux"
+    };
     let text = format!(
         "# Workspace
 
-You are in a sandbox: a Linux VM (aarch64) on the user's macOS machine,
+You are in a sandbox: a Linux VM ({arch}) on the user's {host} machine,
 running as root with full network access. Experiment freely.
 
 ## Checkouts
@@ -307,6 +327,12 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
         sb = sb.volume(m.guest, |b| match m.kind {
             MountKind::Ro => b.bind(&m.host).readonly(),
             MountKind::Rw(q) => b.bind(&m.host).quota(q),
+            MountKind::Live(q) if cfg!(target_os = "linux") => b
+                .bind(&m.host)
+                .quota(q)
+                .stat_virtualization(StatVirtualization::Relaxed)
+                .host_permissions(HostPermissions::Mirror),
+            MountKind::Live(q) => b.bind(&m.host).quota(q),
             MountKind::Disk => b.disk(&m.host).fstype("ext4"),
         });
     }
@@ -463,16 +489,14 @@ async fn boxes() -> Result<Vec<(SandboxHandle, String)>> {
 /// the builder's happens by itself on the next bento command.
 pub async fn ls() -> Result<()> {
     let mut rows = Vec::new();
-    let store = store::image()?;
-    if store.exists() {
+    if store::backing()?.exists() {
         let status = match builder::status().await? {
             Some((status, Some(stale))) => format!("{status} ({stale})"),
             Some((status, None)) => status,
             None => "absent".into(),
         };
         let size = store::usage().map_or("?".into(), util::human_bytes);
-        let path = format!("{} (nix store, max {})", store.display(), store::SIZE);
-        rows.push((builder::NAME.to_string(), status, size, path));
+        rows.push((builder::NAME.to_string(), status, size, store::describe()?));
     }
     for (handle, path) in &boxes().await? {
         let mut status = format!("{:?}", handle.status_snapshot()).to_lowercase();

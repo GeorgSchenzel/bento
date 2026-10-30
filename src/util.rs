@@ -102,9 +102,24 @@ pub fn term_env() -> Vec<(String, String)> {
 }
 
 /// The host's primary DNS servers: what msb forwards a sandbox's DNS to. msb
-/// reads them (macOS dynamic store) once, when the sandbox boots, so after a
-/// network change a running sandbox keeps asking the old network's servers
-/// and name lookups fail. None when they can't be read.
+/// reads them (macOS dynamic store, /etc/resolv.conf on Linux) once, when the
+/// sandbox boots, so after a network change a running sandbox keeps asking the
+/// old network's servers and name lookups fail. None when they can't be read.
+#[cfg(target_os = "linux")]
+pub fn host_dns() -> Option<String> {
+    let text = std::fs::read_to_string("/etc/resolv.conf").ok()?;
+    let servers: Vec<&str> = text
+        .lines()
+        .filter_map(|l| {
+            let mut words = l.split_whitespace();
+            (words.next()? == "nameserver").then(|| words.next())?
+        })
+        .collect();
+    (!servers.is_empty()).then(|| servers.join(" "))
+}
+
+/// See the Linux `host_dns`.
+#[cfg(target_os = "macos")]
 pub fn host_dns() -> Option<String> {
     use std::process::{Command, Stdio};
     let mut child = Command::new("scutil")

@@ -1,14 +1,19 @@
-//! The shared nix store: a case-sensitive APFS sparse image (default APFS
-//! corrupts stores: terminfo ships both `a/` and `A/`), attached at a fixed
-//! mountpoint. `<mountpoint>/nix` is bound as `/nix` into the builder (rw)
+//! The shared nix store, on a case-sensitive filesystem (default APFS corrupts
+//! stores: terminfo ships both `a/` and `A/`). On macOS that takes a
+//! case-sensitive APFS sparse image, attached at a fixed mountpoint; on Linux
+//! it is a plain dir. `<store>/nix` is bound as `/nix` into the builder (rw)
 //! and every box (ro).
 
 use std::fs;
+#[cfg(target_os = "macos")]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
-use anyhow::{bail, Context as _, Result};
+#[cfg(target_os = "macos")]
+use anyhow::bail;
+use anyhow::{Context as _, Result};
 use microsandbox::sandbox::Sandbox;
 
 use crate::util;
@@ -20,7 +25,8 @@ pub const IMAGE: &str =
     "mirror.gcr.io/nixos/nix@sha256:ff480dbb23511aa1c10710aa068ceea5b93fed9bfce5f5379f3a6b07282cbc7b";
 
 /// Sparse: the image only takes the space the store uses, up to this cap.
-pub const SIZE: &str = "60g";
+#[cfg(target_os = "macos")]
+const SIZE: &str = "60g";
 
 const SEED_BOX: &str = "bento-seed";
 
@@ -35,20 +41,44 @@ pub async fn ensure() -> Result<PathBuf> {
     Ok(nix)
 }
 
-/// The sparse image holding the store.
-pub fn image() -> Result<PathBuf> {
+/// What holds the store on the host: the sparse image.
+#[cfg(target_os = "macos")]
+pub fn backing() -> Result<PathBuf> {
     Ok(util::data_dir()?.join("store.sparseimage"))
 }
 
-/// Host disk the store takes (the image's allocated size; nix-collect-garbage
-/// in the builder frees space inside it, not on the host).
-pub fn usage() -> Result<u64> {
-    util::disk_usage(&image()?)
+/// What holds the store on the host: a plain dir.
+#[cfg(target_os = "linux")]
+pub fn backing() -> Result<PathBuf> {
+    Ok(util::data_dir()?.join("store"))
 }
 
+/// The store for `bento ls`.
+pub fn describe() -> Result<String> {
+    let backing = backing()?.display().to_string();
+    #[cfg(target_os = "macos")]
+    return Ok(format!("{backing} (nix store, max {SIZE})"));
+    #[cfg(target_os = "linux")]
+    return Ok(format!("{backing} (nix store)"));
+}
+
+/// Host disk the store takes (on macOS the image's allocated size:
+/// nix-collect-garbage in the builder frees space inside it, not on the host).
+pub fn usage() -> Result<u64> {
+    util::disk_usage(&backing()?)
+}
+
+#[cfg(target_os = "linux")]
+fn ensure_attached() -> Result<PathBuf> {
+    let dir = backing()?;
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    Ok(dir)
+}
+
+#[cfg(target_os = "macos")]
 fn ensure_attached() -> Result<PathBuf> {
     let dir = util::data_dir()?;
-    let image = image()?;
+    let image = backing()?;
     let mnt = dir.join("store");
     if !image.exists() {
         println!(
@@ -84,11 +114,13 @@ fn ensure_attached() -> Result<PathBuf> {
     Ok(mnt)
 }
 
+#[cfg(target_os = "macos")]
 fn is_mountpoint(dir: &Path) -> Result<bool> {
     let parent = dir.parent().context("mountpoint has no parent")?;
     Ok(fs::metadata(dir)?.dev() != fs::metadata(parent)?.dev())
 }
 
+#[cfg(target_os = "macos")]
 fn hdiutil(args: &[&str]) -> Result<()> {
     let out = Command::new("hdiutil")
         .args(args)
@@ -104,6 +136,7 @@ fn hdiutil(args: &[&str]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn path_str(p: &Path) -> Result<&str> {
     p.to_str()
         .with_context(|| format!("non-UTF-8 path {}", p.display()))

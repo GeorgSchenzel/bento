@@ -24,9 +24,10 @@ const CLAUDE_CONFIG: &[&str] = &[
     "commands",
 ];
 
-/// Long-lived token from `claude setup-token`: the host's claude credentials
-/// live in the macOS Keychain, which can't be mounted. The host env var wins
-/// over the file, so the shell decides which account a run uses.
+/// Long-lived token from `claude setup-token`: the host's claude login stays
+/// out of the box (the macOS Keychain can't be mounted; on Linux it's
+/// `~/.claude/.credentials.json`, not among CLAUDE_CONFIG). The host env var
+/// wins over the file, so the shell decides which account a run uses.
 const CLAUDE_TOKEN_VAR: &str = "BENTO_CLAUDE_TOKEN";
 const CLAUDE_TOKEN: &str = ".config/bento/claude-token";
 
@@ -60,11 +61,19 @@ impl Agent {
         }) {
             return args.to_vec();
         }
-        let flag = match self {
-            Agent::Claude => "--dangerously-skip-permissions",
-            Agent::Opencode => "--auto",
+        // Without the setting claude asks to accept bypass mode on every new
+        // box; the host's ~/.claude/settings.json is read-only in here.
+        let flags: &[&str] = match self {
+            Agent::Claude => &[
+                "--dangerously-skip-permissions",
+                "--settings",
+                r#"{"skipDangerousModePermissionPrompt":true}"#,
+            ],
+            Agent::Opencode => &["--auto"],
         };
-        std::iter::once(flag.to_string())
+        flags
+            .iter()
+            .map(|f| f.to_string())
             .chain(args.iter().cloned())
             .collect()
     }
@@ -108,6 +117,9 @@ pub fn sandbox_env(home: &Path) -> Vec<(String, String)> {
         // claude refuses --dangerously-skip-permissions as root (the box's
         // user) unless it knows it's in a sandbox already
         ("IS_SANDBOX".into(), "1".into()),
+        // neither that nor the flag covers the "trust this folder" prompt,
+        // which claude asks per checkout, linked worktrees included
+        ("CLAUDE_CODE_SANDBOXED".into(), "1".into()),
     ]
 }
 

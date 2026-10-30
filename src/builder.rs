@@ -26,7 +26,7 @@ pub const TOOLS: &str = "/nix/var/nix/gcroots/bento/tools";
 const FLAKE: &str = include_str!("../tools/flake.nix");
 const FLAKE_LOCK: &str = include_str!("../tools/flake.lock");
 
-/// Generous: the store volume is capped by its sparse image instead. msb's
+/// Generous: on macOS the store is capped by its sparse image instead. msb's
 /// default bind quota (4 GiB) would fail a cold build with ENOSPC.
 const STORE_QUOTA_MIB: u32 = 64 * 1024;
 

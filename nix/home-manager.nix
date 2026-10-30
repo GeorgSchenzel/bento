@@ -26,7 +26,7 @@ in
     assertions = [
       {
         assertion = supported;
-        message = "bento is only packaged for ${lib.concatStringsSep ", " systems}: the shared store is an APFS sparse image (hdiutil), and microsandbox needs Apple Silicon.";
+        message = "bento is only packaged for ${lib.concatStringsSep ", " systems}: microsandbox needs Apple Silicon on macOS.";
       }
     ];
 

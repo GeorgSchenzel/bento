@@ -78,21 +78,27 @@ async fn main() -> ExitCode {
 
 async fn run(command: Command) -> Result<u8> {
     let config = microsandbox::config::GlobalConfig::default();
+    // The nix package on Linux brings its own patched runtime via MSB_PATH,
+    // which sandboxes honor but `is_runtime_installed` doesn't look at.
+    let packaged_runtime = std::env::var_os("MSB_PATH").is_some();
     if let Command::Install = command {
-        println!("installing the microsandbox runtime...");
-        setup::install_runtime(
-            &config,
-            setup::InstallOptions {
-                force: true, // replaces an older runtime on upgrade
-                ..Default::default()
-            },
-        )
-        .await?;
+        if !packaged_runtime {
+            println!("installing the microsandbox runtime...");
+            setup::install_runtime(
+                &config,
+                setup::InstallOptions {
+                    force: true, // replaces an older runtime on upgrade
+                    ..Default::default()
+                },
+            )
+            .await?;
+        }
+        check_host()?;
         builder::ensure().await?;
         println!("bento: ready");
         return Ok(0);
     }
-    if !setup::is_runtime_installed(&config) {
+    if !packaged_runtime && !setup::is_runtime_installed(&config) {
         bail!("the microsandbox runtime is not installed; run `bento install` first");
     }
     match command {
@@ -160,6 +166,20 @@ async fn run_agent(agent: Agent, args: &[String]) -> Result<u8> {
         env,
     )
     .await
+}
+
+/// Fail on what stops VMs from booting (on Linux: no /dev/kvm or no access to
+/// it) with msb's own hints, rather than on the first sandbox.
+fn check_host() -> Result<()> {
+    let problems: Vec<String> = setup::diagnose()
+        .problems
+        .iter()
+        .map(|p| format!("{}\n  {}", p.headline, p.hints.join("\n  ")))
+        .collect();
+    if !problems.is_empty() {
+        bail!("this host can't run boxes:\n{}", problems.join("\n"));
+    }
+    Ok(())
 }
 
 fn need_tty(what: &str) -> Result<()> {

@@ -33,15 +33,14 @@
       ...
     }:
     let
-      # macOS on Apple Silicon only for now: the shared store is an APFS
-      # sparse image (hdiutil), and microsandbox needs Apple Silicon there
-      packageSystems = [ "aarch64-darwin" ];
-      # other systems keep a devShell for development
-      shellSystems = packageSystems ++ [
-        "x86_64-darwin"
+      # microsandbox needs Apple Silicon on macOS
+      packageSystems = [
+        "aarch64-darwin"
         "x86_64-linux"
         "aarch64-linux"
       ];
+      # other systems keep a devShell for development
+      shellSystems = packageSystems ++ [ "x86_64-darwin" ];
       forAllSystems = nixpkgs.lib.genAttrs packageSystems;
     in
     {

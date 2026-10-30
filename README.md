@@ -10,7 +10,9 @@ Every checkout (or git worktree), and every
 store mounted read-only and nix talking to the builder's daemon. Anything you `nix shell` or `nix build` in
 one box lands in the shared store and is reused by all the others.
 
-macOS on Apple Silicon only, for now.
+Runs on macOS on Apple Silicon, and on Linux (x86_64, aarch64) with KVM:
+your user needs read/write access to `/dev/kvm`, usually through the `kvm`
+group.
 
 ## Install
 
@@ -41,7 +43,9 @@ From a clone: `just install` / `just uninstall`.
 Either way, then run `bento install` once. It installs the microsandbox
 runtime (0.7.8, into `~/.microsandbox`), creates the store, and builds the
 box tools. The first run downloads about 1–2 GB. Nix on the host is not
-needed.
+needed. On Linux the nix package brings its own runtime instead. With
+`cargo install` on NixOS, enable `programs.nix-ld`: the released runtime
+expects a standard dynamic loader.
 
 ## Usage
 
@@ -95,16 +99,19 @@ Plugins that call host-only binaries won't work in the box.
 - **claude** and **opencode** run permission-free: bento passes
   `--dangerously-skip-permissions` / `--auto`, skipped when you pass your own
   permission flag. The box is the sandbox, and the box-wide `IS_SANDBOX=1`
-  lets claude run permission-free as root.
+  lets claude run permission-free as root. `CLAUDE_CODE_SANDBOXED=1` and a
+  `skipDangerousModePermissionPrompt` setting skip claude's "trust this folder"
+  and bypass-mode prompts, so a checkout's hooks and MCP servers run in the
+  box unasked.
 - **opencode** uses the host's `~/.local/share/opencode/auth.json`
   (read-only).
-- **claude** can't use the host login (it lives in the macOS Keychain).
+- **claude** doesn't get the host login (on macOS it lives in the Keychain).
   Create a long-lived token once and save it:
 
   ```sh
   claude setup-token   # on the host
-  mkdir -p ~/.config/bento && pbpaste > ~/.config/bento/claude-token  # after copying the token
-  chmod 600 ~/.config/bento/claude-token
+  mkdir -p ~/.config/bento
+  (umask 077; cat > ~/.config/bento/claude-token)  # paste the token, then Ctrl-D
   ```
 
   Or set `BENTO_CLAUDE_TOKEN` on the host, which takes precedence over the
@@ -152,8 +159,9 @@ quota_gib: 64
 
 ```
 ~/.local/share/bento/
-├── store.sparseimage   case-sensitive APFS, sparse, max 60 GB
-├── store/nix           its mountpoint; /nix for the builder and every box
+├── store.sparseimage   macOS: case-sensitive APFS, sparse, max 60 GB
+├── store/nix           its mountpoint (Linux: a plain dir, no image);
+│                       /nix for the builder and every box
 └── boxes/<box>/        per-box state: root/ (/workspace), ov/ (overlays),
                         docker.raw (/var/lib/docker), agent state,
                         generated git config
@@ -173,8 +181,10 @@ bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:
   When the check fails, or bento changed, the builder is recreated, never
   restarted: published ports and background processes don't survive a
   restart.
-- There is no garbage collection yet; the store only grows (up to the
-  image cap).
+- There is no garbage collection yet; the store only grows (on macOS up to
+  the image cap; on Linux nothing caps its total size). On Linux it needs a
+  filesystem with user xattrs (ext4, btrfs and xfs have them): msb keeps the
+  guest's ownership and modes there.
 
 ## Development
 
