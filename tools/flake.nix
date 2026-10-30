@@ -4,12 +4,9 @@
   description = "bento box tools";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-  # opencode v2 isn't released yet; build the branch with its own flake. No
-  # nixpkgs follows: its node_modules hashes are pinned to its own bun.
-  inputs.opencode.url = "github:anomalyco/opencode/v2";
 
   outputs =
-    { nixpkgs, opencode, ... }:
+    { nixpkgs, ... }:
     let
       systems = [
         "aarch64-linux"
@@ -30,7 +27,7 @@
             name = "bento-tools";
             paths = with pkgs; [
               claude-code
-              opencode.packages.${system}.opencode
+              opencode
               devenv # boxes run in the checkout's devenv shell
               docker # dockerd runs in every box; includes compose and buildx
               git
