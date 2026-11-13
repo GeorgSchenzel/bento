@@ -186,14 +186,15 @@ fn id_shaped(name: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// An error as it crosses the wire: `{"ok":false,"error":{code,message}}`.
+/// pub(crate): the GPU queue (src/gpu.rs) builds the same errors.
 #[derive(Debug)]
-struct BridgeError {
-    code: &'static str,
-    message: String,
+pub(crate) struct BridgeError {
+    pub(crate) code: &'static str,
+    pub(crate) message: String,
 }
 
 impl BridgeError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         BridgeError {
             code,
             message: message.into(),
@@ -221,16 +222,20 @@ pub struct Caller {
 struct Daemon {
     data_dir: PathBuf,
     rt: tokio::runtime::Handle,
+    /// The GPU job queue (decisions §6); started with the daemon.
+    gpu: crate::gpu::Queue,
 }
 
 /// Run the bridge daemon until killed. Started by the user (a systemd
-/// --user unit later); nothing auto-starts it.
+/// --user unit later); nothing auto-starts it. Starting it also starts the
+/// GPU job queue (one worker, one job at a time — decisions §6).
 pub async fn serve(port: u16) -> Result<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .with_context(|| format!("binding 127.0.0.1:{port}"))?;
     let daemon = Arc::new(Daemon {
         data_dir: util::data_dir()?,
         rt: tokio::runtime::Handle::current(),
+        gpu: crate::gpu::Queue::start()?,
     });
     eprintln!("bento serve: listening on 127.0.0.1:{port} (boxes: {HOST}:{port})");
     // blocking accept on a dedicated thread, off the async runtime
@@ -358,20 +363,23 @@ fn handle_request(
             "the first request on a connection must be hello",
         )
     })?;
-    dispatch(c, op, req)
+    dispatch(daemon, c, op, req)
 }
 
-/// The dispatch table: one arm per op, so G1 (gpu.*) and F3 (forest.new's
-/// brief) add theirs without touching the plumbing above.
-fn dispatch(caller: &Caller, op: &str, req: &Value) -> Result<Value, BridgeError> {
+/// The dispatch table: one arm per op (decisions §1). The GPU arms hand the
+/// whole request to the queue (src/gpu.rs), which owns the safety rules.
+fn dispatch(daemon: &Daemon, caller: &Caller, op: &str, req: &Value) -> Result<Value, BridgeError> {
     match op {
         "forest.ls" => forest_ls(caller),
         "forest.add" => forest_add(caller, req),
         "forest.name" => forest_name(caller, req),
         "forest.new" => forest_new(caller, req),
+        "gpu.submit" => daemon.gpu.submit(caller, req),
+        "gpu.status" => daemon.gpu.status(caller, req),
+        "gpu.ls" => daemon.gpu.ls(caller),
         op if op.starts_with("gpu.") => Err(BridgeError::new(
             "unknown_op",
-            format!("'{op}' arrives with G1 (the GPU queue)"),
+            format!("unknown op '{op}' (gpu.submit, gpu.status, gpu.ls)"),
         )),
         _ => Err(BridgeError::new("unknown_op", format!("unknown op '{op}'"))),
     }
@@ -681,7 +689,8 @@ fn new_args(name: &str, repos: &[String], from: Option<&str>) -> Vec<String> {
 
 // --- request field helpers -------------------------------------------------
 
-fn string_field(req: &Value, key: &str) -> Result<String, BridgeError> {
+/// pub(crate): the GPU queue reads request fields with the same errors.
+pub(crate) fn string_field(req: &Value, key: &str) -> Result<String, BridgeError> {
     req.get(key)
         .and_then(Value::as_str)
         .map(String::from)
@@ -911,6 +920,9 @@ mod tests {
         Daemon {
             data_dir: data_dir.to_path_buf(),
             rt: handle(),
+            // a real queue on a temp state dir: validation paths work, and no
+            // test submits a runnable job (the worker stays idle)
+            gpu: crate::gpu::Queue::start_at(&data_dir.join("gpu-state")).unwrap(),
         }
     }
 
@@ -1028,17 +1040,19 @@ mod tests {
     #[test]
     fn dispatch_table_rejects_what_is_not_implemented() {
         let dir = tempdir("dispatch");
+        let daemon = test_daemon(&dir);
         let caller = caller_at(&dir); // not a workforest: no forests/ layout
         for (op, code, needle) in [
             ("nope", "unknown_op", "unknown op"),
-            ("gpu.submit", "unknown_op", "G1"),
+            ("gpu.magic", "unknown_op", "gpu.submit"),
         ] {
-            let err = dispatch(&caller, op, &json!({"op": op})).unwrap_err();
+            let err = dispatch(&daemon, &caller, op, &json!({"op": op})).unwrap_err();
             assert_eq!(err.code, code, "{op}");
             assert!(err.message.contains(needle), "{op}: {}", err.message);
         }
         // the handoff (a brief) is F3's, and says so
         let err = dispatch(
+            &daemon,
             &caller,
             "forest.new",
             &json!({"op": "forest.new", "name": "x", "repos": ["bento"], "brief": "do it"}),
@@ -1051,6 +1065,7 @@ mod tests {
     #[test]
     fn forest_ops_validate_their_args() {
         let dir = tempdir("args");
+        let daemon = test_daemon(&dir);
         let caller = caller_at(&dir); // a checkout's box, not a forest's
                                       // add and name need a workforest box
         for req in [
@@ -1058,7 +1073,7 @@ mod tests {
             json!({"op": "forest.name", "branch": "x"}),
         ] {
             let op = req["op"].as_str().unwrap();
-            let err = dispatch(&caller, op, &req).unwrap_err();
+            let err = dispatch(&daemon, &caller, op, &req).unwrap_err();
             assert_eq!(err.code, "not_a_forest", "{req}");
         }
         // new validates names, refs and repos before running anything
@@ -1088,7 +1103,7 @@ mod tests {
                 "bad_request",
             ),
         ] {
-            let err = dispatch(&caller, "forest.new", &req).unwrap_err();
+            let err = dispatch(&daemon, &caller, "forest.new", &req).unwrap_err();
             assert_eq!(err.code, code, "{req}: {}", err.message);
         }
     }
