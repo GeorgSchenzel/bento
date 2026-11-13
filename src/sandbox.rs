@@ -304,9 +304,11 @@ fn write_gitconfig(forest: &Forest, state: &Path) -> Result<PathBuf> {
 }
 
 /// The hc template every box gets (decisions §4): opencode as an agent,
-/// auto-approving since the box is the sandbox. Mounted as a single file,
+/// auto-approving since the box is the sandbox; --standalone gives each agent
+/// its own server (a shared background service collides on its port), and
+/// opencode reports its status (OSC 7501) itself, so hc waits for that. Mounted as a single file,
 /// so anything else the box keeps under ~/.config/herdr-core stays visible.
-const HC_TEMPLATE: &str = "---\ndescription: opencode agent (auto-approves; the box is the sandbox)\ncommand: opencode --auto\nready: quiet\n---\n";
+const HC_TEMPLATE: &str = "---\ndescription: opencode agent (auto-approves; the box is the sandbox)\ncommand: opencode --standalone --auto\n---\n";
 
 /// Names are path-derived; refuse to touch a box another checkout owns.
 fn guard(handle: &SandboxHandle, forest: &Forest) -> Result<()> {
