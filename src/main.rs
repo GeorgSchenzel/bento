@@ -44,6 +44,13 @@ enum Command {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
+    #[command(
+        about = "Run a command in the box for this checkout or forest (no TTY needed; stdio piped, exit code passed through)"
+    )]
+    Exec {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
     #[command(about = "Open a shell in the builder (owner of the shared nix store)")]
     Builder {
         #[command(subcommand)]
@@ -142,6 +149,11 @@ async fn run(command: Command) -> Result<u8> {
         }
         Command::Claude { args } => run_agent(Agent::Claude, &args).await,
         Command::Opencode { args } => run_agent(Agent::Opencode, &args).await,
+        Command::Exec { args } => {
+            let forest = forest::discover()?;
+            let sb = sandbox::ensure_running(&forest).await?;
+            util::exec(&sb, &args[0], &args[1..], &forest.cwd).await
+        }
     }
 }
 
@@ -187,4 +199,44 @@ fn need_tty(what: &str) -> Result<()> {
         bail!("stdin is not a terminal; `{what}` needs an interactive terminal");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::error::ErrorKind;
+
+    fn exec_args(argv: &[&str]) -> Vec<String> {
+        match Cli::try_parse_from(argv).unwrap().command {
+            Command::Exec { args } => args,
+            other => panic!("not an exec command: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn exec_takes_a_command_with_and_without_the_separator() {
+        // `--` separates bento's flags from the command's; without it the
+        // first word is the command and the rest is passed raw
+        assert_eq!(
+            exec_args(&["bento", "exec", "--", "cat", "-v"]),
+            ["cat", "-v"]
+        );
+        assert_eq!(exec_args(&["bento", "exec", "cat", "-v"]), ["cat", "-v"]);
+        assert_eq!(
+            exec_args(&["bento", "exec", "--", "sh", "-c", "exit 3"]),
+            ["sh", "-c", "exit 3"]
+        );
+        assert_eq!(exec_args(&["bento", "exec", "--", "--weird"]), ["--weird"]);
+    }
+
+    #[test]
+    fn exec_without_a_command_is_a_usage_error() {
+        for argv in [
+            ["bento", "exec"].as_slice(),
+            ["bento", "exec", "--"].as_slice(),
+        ] {
+            let err = Cli::try_parse_from(argv).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument);
+        }
+    }
 }

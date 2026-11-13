@@ -75,7 +75,7 @@ pub async fn ensure() -> Result<PathBuf> {
             None if !healthy() => "daemon not answering",
             None => return Ok(nix),
         };
-        println!("builder: recreating ({reason})");
+        eprintln!("builder: recreating ({reason})");
         util::remove_sandbox(NAME).await?;
     }
     create(&nix, &spec()).await?;
@@ -88,7 +88,7 @@ pub async fn restart() -> Result<()> {
     let _lock = lock()?;
     let nix = store::ensure().await?;
     if util::remove_sandbox(NAME).await? {
-        println!("builder: removed");
+        eprintln!("builder: removed");
     }
     create(&nix, &spec()).await
 }
@@ -133,7 +133,7 @@ async fn create(nix: &Path, spec: &str) -> Result<()> {
     // msb silently drops a published port that is already taken
     TcpListener::bind((Ipv4Addr::LOCALHOST, PORT))
         .with_context(|| format!("host port 127.0.0.1:{PORT} is in use; the builder needs it"))?;
-    println!("builder: creating '{NAME}'");
+    eprintln!("builder: creating '{NAME}'");
     let sb = Sandbox::builder(NAME)
         .image(store::IMAGE)
         .user("0:0")
@@ -158,7 +158,7 @@ async fn create(nix: &Path, spec: &str) -> Result<()> {
     util::run_streamed(&sb, "starting the builder", script).await?;
     for _ in 0..50 {
         if healthy() {
-            println!("builder: ready");
+            eprintln!("builder: ready");
             return Ok(());
         }
         tokio::time::sleep(Duration::from_millis(200)).await;

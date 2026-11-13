@@ -81,7 +81,7 @@ fn ensure_attached() -> Result<PathBuf> {
     let image = backing()?;
     let mnt = dir.join("store");
     if !image.exists() {
-        println!(
+        eprintln!(
             "store: creating {} (case-sensitive APFS, max {SIZE})",
             image.display()
         );
@@ -151,7 +151,7 @@ async fn seed(mnt: &Path) -> Result<()> {
         fs::remove_dir_all(&tmp).with_context(|| format!("removing {}", tmp.display()))?;
     }
     fs::create_dir_all(&tmp)?;
-    println!("store: seeding from {IMAGE}...");
+    eprintln!("store: seeding from {IMAGE}...");
     util::remove_sandbox(SEED_BOX).await?;
     let sb = Sandbox::builder(SEED_BOX)
         .image(IMAGE)
@@ -166,6 +166,6 @@ async fn seed(mnt: &Path) -> Result<()> {
     util::remove_sandbox(SEED_BOX).await?;
     res?;
     fs::rename(&tmp, mnt.join("nix")).context("activating the seeded store")?;
-    println!("store: seeded");
+    eprintln!("store: seeded");
     Ok(())
 }
