@@ -55,6 +55,7 @@ Run these from inside a checkout or a forest:
 bento enter      # bash in this checkout's box (created/started on demand)
 bento claude     # claude in the box (args are passed through)
 bento opencode   # opencode in the box (args are passed through)
+bento exec       # run a command in the box without a TTY (see below)
 bento start      # (re)create the box, applying config changes
 bento stop       # stop the box (the builder keeps running)
 bento rm         # remove the box and its state, archiving its chats
@@ -87,6 +88,18 @@ written there stay out of the host forest dir. Bento writes a short guide to
 the box for the agents there, as `CLAUDE.md` and `AGENTS.md`: what's live on
 the host, the checkouts and their branches, devenv, `just`, nix and docker.
 
+### exec
+
+`bento exec [--] <cmd> [args...]` runs a command in the box without a TTY:
+stdin, stdout and stderr are piped through byte-exact and the exit code is
+passed through, with nothing of bento's own on stdout (its progress and
+warnings go to stderr). It starts the box if needed and starts in the guest
+dir matching the host cwd, like the other commands. Made for scripts and
+machine-to-machine pipes, e.g.
+`hc machine add --via 'bento exec -- hc connect'`, `printf 'a\0b' | bento exec -- cat`.
+It does not enter a devenv shell (see below); wrap in
+`bento exec -- devenv shell -- <cmd>` for a checkout's tools.
+
 ### Agents
 
 The box sees the host's agent config read-only: `~/.claude/{settings.json,
@@ -105,7 +118,9 @@ up.
 
 - **claude** and **opencode** run permission-free: bento passes
   `--dangerously-skip-permissions` / `--auto`, skipped when you pass your own
-  permission flag. The box is the sandbox, and the box-wide `IS_SANDBOX=1`
+  permission flag. opencode only accepts `--auto` after a subcommand
+  (`bento opencode run msg` runs `opencode run --auto msg`); claude's flag
+  goes in front as before. The box is the sandbox, and the box-wide `IS_SANDBOX=1`
   lets claude run permission-free as root. `CLAUDE_CODE_SANDBOXED=1` and a
   `skipDangerousModePermissionPrompt` setting skip claude's "trust this folder"
   and bypass-mode prompts, so a checkout's hooks and MCP servers run in the
@@ -131,7 +146,8 @@ up.
 nearest `devenv.nix` up from the cwd, and each checkout's `.devenv` is
 overlaid like `target` (see below). The first activation builds the shell
 through the builder and can take minutes; after that it's cached in the
-shared store.
+shared store. `exec` skips the wrapper — it runs the command directly, for
+byte-exact stdio — so ask for the shell yourself when you want it.
 
 At the root of a forest with several checkouts there is no devenv shell;
 `cd` into a checkout for its tools. A forest of one starts in its checkout.

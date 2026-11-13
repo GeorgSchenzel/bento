@@ -46,9 +46,12 @@ impl Agent {
         }
     }
 
-    /// Launch args: the user's args with a permission-skipping flag in
-    /// front, unless they set permissions themselves. The box is the
-    /// sandbox, so agents run permission-free.
+    /// Launch args: the user's args with a permission-skipping flag added,
+    /// unless they set permissions themselves. The box is the sandbox, so
+    /// agents run permission-free. opencode takes subcommands (`run`,
+    /// `serve`, …) and only accepts `--auto` after them — in front it makes
+    /// opencode print help and exit 0 — so for a subcommand the flag goes
+    /// right after it.
     pub fn launch_args(&self, args: &[String]) -> Vec<String> {
         const PERMISSIONS: &[&str] = &[
             "--dangerously-skip-permissions",
@@ -73,11 +76,19 @@ impl Agent {
             ],
             Agent::Opencode => &["--auto"],
         };
-        flags
-            .iter()
-            .map(|f| f.to_string())
-            .chain(args.iter().cloned())
-            .collect()
+        match (self, args.first()) {
+            (Agent::Opencode, Some(first)) if !first.starts_with('-') => {
+                std::iter::once(first.clone())
+                    .chain(flags.iter().map(|f| f.to_string()))
+                    .chain(args.iter().skip(1).cloned())
+                    .collect()
+            }
+            _ => flags
+                .iter()
+                .map(|f| f.to_string())
+                .chain(args.iter().cloned())
+                .collect(),
+        }
     }
 
     /// Per-run env (credentials stay out of the sandbox config).
@@ -298,6 +309,69 @@ fn opencode_credentials(home: &Path) -> Result<Option<String>> {
 mod tests {
     use super::*;
     use std::os::unix::fs::{symlink, PermissionsExt as _};
+
+    fn args(list: &[&str]) -> Vec<String> {
+        list.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn opencode_flag_goes_after_a_subcommand() {
+        assert_eq!(
+            Agent::Opencode.launch_args(&args(&["run", "do it"])),
+            args(&["run", "--auto", "do it"])
+        );
+    }
+
+    #[test]
+    fn opencode_flag_in_front_without_a_subcommand() {
+        assert_eq!(Agent::Opencode.launch_args(&[]), args(&["--auto"]));
+        assert_eq!(
+            Agent::Opencode.launch_args(&args(&["--some-flag"])),
+            args(&["--auto", "--some-flag"])
+        );
+    }
+
+    #[test]
+    fn own_permission_flag_passes_through() {
+        assert_eq!(
+            Agent::Opencode.launch_args(&args(&["run", "--auto", "msg"])),
+            args(&["run", "--auto", "msg"])
+        );
+        assert_eq!(
+            Agent::Opencode.launch_args(&args(&["run", "--yolo", "msg"])),
+            args(&["run", "--yolo", "msg"])
+        );
+        assert_eq!(
+            Agent::Claude.launch_args(&args(&["--permission-mode", "acceptEdits", "msg"])),
+            args(&["--permission-mode", "acceptEdits", "msg"])
+        );
+    }
+
+    #[test]
+    fn claude_flags_are_unchanged() {
+        assert_eq!(
+            Agent::Claude.launch_args(&args(&["-p", "hi"])),
+            args(&[
+                "--dangerously-skip-permissions",
+                "--settings",
+                r#"{"skipDangerousModePermissionPrompt":true}"#,
+                "-p",
+                "hi"
+            ])
+        );
+        // claude is not subcommand-based: a word up front is a prompt, and
+        // its flags stay in front of it
+        assert_eq!(
+            Agent::Claude.launch_args(&args(&["run", "msg"])),
+            args(&[
+                "--dangerously-skip-permissions",
+                "--settings",
+                r#"{"skipDangerousModePermissionPrompt":true}"#,
+                "run",
+                "msg"
+            ])
+        );
+    }
 
     fn write(path: &Path) {
         fs::create_dir_all(path.parent().unwrap()).unwrap();

@@ -251,3 +251,87 @@ pub async fn attach(
     // negative: detached with the detach keys
     Ok(if code < 0 { 0 } else { code as u8 })
 }
+
+/// Run a command with piped, byte-exact stdio and return its exit code.
+/// The counterpart of [`attach`] for what must not have a TTY: scripts and
+/// machine-to-machine pipes (`hc machine add --via 'bento exec -- hc
+/// connect'`). No terminfo/locale/devenv wrapper and no extra bytes on
+/// stdout (bento's own progress goes to stderr), so callers can rely on
+/// getting exactly the command's output; stdin is forwarded until it ends,
+/// even past the command's exit. The command runs with the box's env (PATH
+/// with the box tools, HOME) in `cwd`, like the other box commands but
+/// without the devenv shell — wrap in `devenv shell --` for a checkout's
+/// tools.
+pub async fn exec(sb: &Sandbox, cmd: &str, args: &[String], cwd: &str) -> Result<u8> {
+    let mut handle = sb
+        .exec_stream_with(cmd, |o| o.args(args.to_vec()).cwd(cwd).stdin_pipe())
+        .await
+        .with_context(|| format!("running {cmd}"))?;
+
+    // Stdin is read on a plain thread, not spawn_blocking: parked on an
+    // open stdin (a TTY, a pipe nobody closes) it must not keep the
+    // runtime from shutting down after the command exits. It dies with the
+    // process.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Vec<u8>>(16);
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdin = std::io::stdin().lock();
+        let mut buf = [0u8; 64 * 1024];
+        loop {
+            match stdin.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        break; // the command exited, nobody reads anymore
+                    }
+                }
+            }
+        }
+    });
+    if let Some(sink) = handle.take_stdin() {
+        tokio::spawn(async move {
+            while let Some(chunk) = rx.recv().await {
+                if sink.write(&chunk).await.is_err() {
+                    return; // the command exited, its stdin is gone
+                }
+            }
+            // host stdin ended: the command sees EOF
+            let _ = sink.close().await;
+        });
+    }
+
+    let mut code: Option<i32> = None;
+    while let Some(event) = handle.recv().await {
+        match event {
+            ExecEvent::Stdout(b) => {
+                if let Err(e) = std::io::stdout().write_all(&b) {
+                    // like a SIGPIPE death: don't leave the command running
+                    // in the box against a closed pipe
+                    let _ = handle.kill().await;
+                    return Err(e).context("writing the command's stdout");
+                }
+            }
+            ExecEvent::Stderr(b) => {
+                std::io::stderr()
+                    .write_all(&b)
+                    .context("writing the command's stderr")?;
+            }
+            ExecEvent::Exited { code: c } => {
+                code = Some(c);
+                break;
+            }
+            ExecEvent::Failed(f) => bail!("running {cmd}: {}", f.message),
+            // the command exited without reading all of its stdin
+            ExecEvent::StdinError(_) | ExecEvent::Started { .. } => {}
+        }
+    }
+    std::io::stdout().flush().context("flushing stdout")?;
+    std::io::stderr().flush().context("flushing stderr")?;
+    let code = code.with_context(|| format!("lost connection to the box while running {cmd}"))?;
+    // a signal death (negative code) is reported like a shell reports it
+    Ok(if code < 0 {
+        128i32.saturating_sub(code) as u8
+    } else {
+        code as u8
+    })
+}

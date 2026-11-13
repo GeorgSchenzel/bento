@@ -337,7 +337,7 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
             MountKind::Disk => b.disk(&m.host).fstype("ext4"),
         });
     }
-    println!("box '{}': creating", forest.name);
+    eprintln!("box '{}': creating", forest.name);
     let sb = sb
         .create_detached()
         .await
@@ -369,10 +369,10 @@ pub async fn ensure_running(forest: &Forest) -> Result<Sandbox> {
     let sb = match handle.connect().await {
         Ok(sb) => {
             if !current {
-                println!("warning: box config changed (bento.yaml, agent config or bento itself); run `bento start` to apply");
+                eprintln!("warning: box config changed (bento.yaml, agent config or bento itself); run `bento start` to apply");
             }
             if util::dns_stale(&state.join("host-dns")) {
-                println!("warning: host network changed since the box started, so its DNS fails; run `bento start` to fix (restarts the box)");
+                eprintln!("warning: host network changed since the box started, so its DNS fails; run `bento start` to fix (restarts the box)");
             }
             sb
         }
@@ -381,7 +381,7 @@ pub async fn ensure_running(forest: &Forest) -> Result<Sandbox> {
             return create(forest).await;
         }
         Err(MicrosandboxError::SandboxNotRunning(_)) => {
-            println!("box '{}': starting", forest.name);
+            eprintln!("box '{}': starting", forest.name);
             let sb = handle
                 .start_detached()
                 .await
