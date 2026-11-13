@@ -25,6 +25,7 @@ pub const TOOLS: &str = "/nix/var/nix/gcroots/bento/tools";
 
 const FLAKE: &str = include_str!("../tools/flake.nix");
 const FLAKE_LOCK: &str = include_str!("../tools/flake.lock");
+const FOREST_CLIENT: &str = include_str!("../tools/forest-client.py");
 
 /// Generous: on macOS the store is capped by its sparse image instead. msb's
 /// default bind quota (4 GiB) would fail a cold build with ENOSPC.
@@ -51,7 +52,13 @@ nohup __TOOLS__/bin/socat TCP-LISTEN:__PORT__,reuseaddr,fork \
 "#;
 
 fn tools_hash() -> String {
-    util::fingerprint(&[FLAKE, FLAKE_LOCK])
+    hash_tools(FLAKE, FLAKE_LOCK, FOREST_CLIENT)
+}
+
+/// The tools are every file of `tools/` the builder builds; a change in any
+/// one of them rebuilds the tools (and so recreates the builder).
+fn hash_tools(flake: &str, lock: &str, client: &str) -> String {
+    util::fingerprint(&[flake, lock, client])
 }
 
 /// Everything the running builder depends on; a change recreates it.
@@ -151,6 +158,9 @@ async fn create(nix: &Path, spec: &str) -> Result<()> {
     sb.shell("mkdir -p /bento/flake").await?;
     sb.fs().write("/bento/flake/flake.nix", FLAKE).await?;
     sb.fs().write("/bento/flake/flake.lock", FLAKE_LOCK).await?;
+    sb.fs()
+        .write("/bento/flake/forest-client.py", FOREST_CLIENT)
+        .await?;
     let script = START
         .replace("__HASH__", &tools_hash())
         .replace("__TOOLS__", TOOLS)
@@ -193,4 +203,27 @@ pub async fn enter() -> Result<u8> {
     ensure().await?;
     let sb = Sandbox::get(NAME).await?.connect().await?;
     util::attach(&sb, "bash", &[], "/", util::term_env()).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const F: &str = "flake";
+    const L: &str = "lock";
+    const C: &str = "client";
+
+    /// Every file of tools/ takes part in the hash: a change to any of
+    /// them (here: the forest client) must change the tools hash, or the
+    /// builder would keep serving stale tools after an edit.
+    #[test]
+    fn tools_hash_covers_every_tools_file() {
+        for changed in [
+            hash_tools(F, L, "client b"),
+            hash_tools("flake b", L, C),
+            hash_tools(F, "lock b", C),
+        ] {
+            assert_ne!(hash_tools(F, L, C), changed);
+        }
+    }
 }
