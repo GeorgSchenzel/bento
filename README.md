@@ -140,6 +140,13 @@ up.
   file. Switch accounts by setting it per run:
   `BENTO_CLAUDE_TOKEN=$WORK_TOKEN bento claude`.
 
+Bento also ships an agent skill, [`skills/forest/SKILL.md`](skills/forest/SKILL.md),
+teaching agents in a box the `forest` command: what a forest is, listing and
+adding repos, naming the work, handing work off to a new forest, and queueing
+GPU jobs on the host. Install it on the host into `~/.claude/skills/forest/`
+and `~/.config/opencode/skills/forest/`; both are mounted read-only into every
+box (see above), so claude and opencode find it in every forest.
+
 ### devenv
 
 `enter`, `claude` and `opencode` run inside the `devenv shell` of the
