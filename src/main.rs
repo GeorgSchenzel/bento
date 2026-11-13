@@ -1,4 +1,5 @@
 mod agent;
+mod bridge;
 mod builder;
 mod forest;
 mod sandbox;

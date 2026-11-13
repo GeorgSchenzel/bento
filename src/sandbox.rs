@@ -13,6 +13,7 @@ use microsandbox::{MicrosandboxError, NetworkPolicy, NetworkProfile};
 use microsandbox_image::ext4::{format_ext4, Ext4FormatOptions};
 
 use crate::agent;
+use crate::bridge;
 use crate::builder;
 use crate::forest::{self, Forest, WORKDIR};
 use crate::store;
@@ -92,7 +93,7 @@ fn box_state_dir(name: &str) -> Result<PathBuf> {
     Ok(util::data_dir()?.join("boxes").join(name))
 }
 
-fn env(home: &Path) -> Vec<(String, String)> {
+fn env(home: &Path, forest: &Forest) -> Result<Vec<(String, String)>> {
     let mut env = vec![
         ("HOME".into(), home.display().to_string()),
         ("NIX_REMOTE".into(), format!("unix://{NIX_SOCK}")),
@@ -113,7 +114,20 @@ fn env(home: &Path) -> Vec<(String, String)> {
         ),
     ];
     env.extend(agent::sandbox_env(home));
-    env
+    // The bridge: how this box reaches the host daemon (`bento serve`).
+    // The identity file is created here (read-or-create), so the token is
+    // fixed the first time a box is used and survives recreation.
+    let info = bridge::ensure_box_info(&state_dir(forest)?, &forest.name, &forest.dir)?;
+    env.push((
+        "BENTO_BRIDGE".into(),
+        format!("{}:{}", bridge::HOST, info.port),
+    ));
+    env.push(("BENTO_BRIDGE_TOKEN".into(), info.token));
+    env.push(("BENTO_BOX".into(), forest.name.clone()));
+    if let Some(name) = bridge::workforest_name(&forest.dir) {
+        env.push(("BENTO_FOREST".into(), name));
+    }
+    Ok(env)
 }
 
 fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<Mount>> {
@@ -304,7 +318,7 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
     let state = state_dir(forest)?;
     fs::create_dir_all(&state).with_context(|| format!("creating {}", state.display()))?;
     let mounts = mounts(forest, &nix, &home, &state)?;
-    let env = env(&home);
+    let env = env(&home, forest)?;
     let spec = spec(&mounts, &env);
 
     let mut sb = Sandbox::builder(forest.name.clone())
@@ -348,6 +362,16 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
 }
 
 fn spec(mounts: &[Mount], env: &[(String, String)]) -> String {
+    // BENTO_BRIDGE* is excluded: the daemon address and the box's token are
+    // per-box runtime state, not config — a rotated token (regenerated
+    // bridge.json) or a daemon on another port must not look like a config
+    // change (a "box config changed" warning, or a stopped box silently
+    // recreated by ensure_running). BENTO_BOX/BENTO_FOREST name the box
+    // itself and stay in.
+    let env: Vec<_> = env
+        .iter()
+        .filter(|(key, _)| !key.starts_with("BENTO_BRIDGE"))
+        .collect();
     let desc = format!("{mounts:?}{env:?}");
     util::fingerprint(&[store::IMAGE, &builder::PORT.to_string(), &desc])
 }
@@ -364,7 +388,7 @@ pub async fn ensure_running(forest: &Forest) -> Result<Sandbox> {
     let state = state_dir(forest)?;
     fs::create_dir_all(&state)?;
     let home = util::home()?;
-    let want = spec(&mounts(forest, &nix, &home, &state)?, &env(&home));
+    let want = spec(&mounts(forest, &nix, &home, &state)?, &env(&home, forest)?);
     let current = util::label(&handle, "bento.spec").as_deref() == Some(want.as_str());
     let sb = match handle.connect().await {
         Ok(sb) => {
@@ -625,4 +649,36 @@ async fn remove(name: &str) -> Result<Option<u64>> {
         println!("box '{name}': freed {}", util::human_bytes(bytes));
     }
     Ok(freed)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bridge_env_leaves_no_fingerprint_trace() {
+        let mounts = [Mount::ro("/nix", "/nix/store")];
+        let base = vec![
+            ("HOME".into(), "/home/g".into()),
+            ("BENTO_BOX".into(), "bento-forest_x".into()),
+            ("BENTO_FOREST".into(), "x".into()),
+        ];
+        let with_bridge = |addr: &str, token: &str| {
+            let mut env = base.clone();
+            env.push(("BENTO_BRIDGE".into(), addr.into()));
+            env.push(("BENTO_BRIDGE_TOKEN".into(), token.into()));
+            spec(&mounts, &env)
+        };
+        // different tokens and ports: same fingerprint
+        assert_eq!(
+            with_bridge("host.microsandbox.internal:17761", "aa"),
+            with_bridge("host.microsandbox.internal:17771", "bb")
+        );
+        // ... and the same as not passing the bridge vars at all
+        assert_eq!(spec(&mounts, &base), with_bridge("x", "y"));
+        // a different BENTO_BOX (allowed to stay in) does change it
+        let mut other = base.clone();
+        other[1] = ("BENTO_BOX".into(), "bento-forest_y".into());
+        assert_ne!(spec(&mounts, &base), spec(&mounts, &other));
+    }
 }
