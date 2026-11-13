@@ -181,6 +181,12 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
         home.join(".gitconfig"),
         write_gitconfig(forest, state)?,
     ));
+    // The single file only, not the dir: the box's own ~/.config/herdr-core
+    // (the box core's state) must stay beside it.
+    mounts.push(Mount::ro(
+        home.join(".config/herdr-core/templates/opencode.md"),
+        write(state, "hc-template-opencode.md", HC_TEMPLATE)?,
+    ));
     mounts.push(Mount::disk(
         DOCKER_ROOT,
         docker_disk(state, forest.quota_mib())?,
@@ -296,6 +302,11 @@ fn write_gitconfig(forest: &Forest, state: &Path) -> Result<PathBuf> {
     );
     write(state, "gitconfig", &text)
 }
+
+/// The hc template every box gets (decisions §4): opencode as an agent,
+/// auto-approving since the box is the sandbox. Mounted as a single file,
+/// so anything else the box keeps under ~/.config/herdr-core stays visible.
+const HC_TEMPLATE: &str = "---\ndescription: opencode agent (auto-approves; the box is the sandbox)\ncommand: opencode --auto\nready: quiet\n---\n";
 
 /// Names are path-derived; refuse to touch a box another checkout owns.
 fn guard(handle: &SandboxHandle, forest: &Forest) -> Result<()> {
