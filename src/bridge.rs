@@ -163,14 +163,19 @@ pub fn machine_name(dir_name: &str) -> String {
     name
 }
 
-/// hc's rule: a name that could be a terminal id (`t`, then digits with no
-/// leading zero) must not be used as a machine name.
+/// hc's id alphabet (terminals.rs `SYMBOLS`): digits plus the consonants it
+/// draws terminal ids from. A name `t` + these is a terminal id shape.
+const HC_ID_ALPHABET: &[u8; 30] = b"0123456789bcdfghjkmnpqrstvwxyz";
+
+/// hc's rule (terminals.rs `id_shaped`): a name that could be a terminal id
+/// (`t`, then 1-9 and only id-alphabet chars — `t440s` and `t1b` count) must
+/// not be used as a machine name.
 fn id_shaped(name: &str) -> bool {
     let Some(rest) = name.strip_prefix('t') else {
         return false;
     };
-    let mut chars = rest.chars();
-    matches!(chars.next(), Some('1'..='9')) && chars.all(|c| c.is_ascii_digit())
+    let mut bytes = rest.bytes();
+    matches!(bytes.next(), Some(b'1'..=b'9')) && bytes.all(|b| HC_ID_ALPHABET.contains(&b))
 }
 
 // ---------------------------------------------------------------------------
@@ -825,8 +830,11 @@ mod tests {
         // capped at hc's 32 chars
         assert_eq!(machine_name(&"a".repeat(40)).len(), 32);
         assert_eq!(machine_name(&"a".repeat(40)), "a".repeat(32));
-        // never shaped like a terminal id (t<digits>)
+        // never shaped like a terminal id (t<digits>, or hc's wider id
+        // alphabet: t440s, t1b, t9zzz all count)
         assert_eq!(machine_name("t12"), "t12-");
+        assert_eq!(machine_name("t440s"), "t440s-");
+        assert_eq!(machine_name("t1b"), "t1b-");
         let t = machine_name(&format!("t{}", "1".repeat(40)));
         assert_eq!(t.len(), 32);
         assert!(t.ends_with('-') && !id_shaped(&t));
