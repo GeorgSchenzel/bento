@@ -100,6 +100,28 @@ machine-to-machine pipes, e.g.
 It does not enter a devenv shell (see below); wrap in
 `bento exec -- devenv shell -- <cmd>` for a checkout's tools.
 
+### The bridge (`bento serve`)
+
+`bento serve` runs the daemon the boxes talk to: the in-box `forest`
+command and GPU-job queueing are client calls to it (TCP, JSON lines,
+`127.0.0.1` only — boxes reach it as `host.microsandbox.internal`).
+Started by the user, e.g. `bento serve --port 17761 &`; nothing
+auto-starts it.
+
+- Port: `--port`, else `$BENTO_BRIDGE_PORT`, else 17761.
+- Every box carries its identity in the env: `BENTO_BRIDGE` (the daemon's
+  `host:port`), `BENTO_BRIDGE_TOKEN` (a random 128-bit token, generated
+  once per box, kept in `~/.local/share/bento/boxes/<box>/bridge.json`
+  with the box's forest dir and hc machine name), `BENTO_BOX`, and
+  `BENTO_FOREST` (workforests only). The daemon authenticates by the
+  token alone; a connection must start with `hello`.
+- Ops (protocol, request and reply shapes: `src/bridge.rs`): `hello`,
+  `forest.ls`, `forest.add`, `forest.name`, `forest.new` (create only; a
+  `brief` handoff is not implemented yet), `gpu.*` (with G1). Forest work
+  runs the host's `forest` binary — `$BENTO_FOREST_BIN`, else `forest` on
+  `PATH` — as argv, never through a shell, always `--no-fetch` for
+  anything that could fetch.
+
 ### Agents
 
 The box sees the host's agent config read-only: `~/.claude/{settings.json,

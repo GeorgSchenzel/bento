@@ -24,3 +24,6 @@ result
 
 # bento box overlays (linux build artifacts)
 .bento/
+
+# spike scratch (gitignored test client etc.)
+.spike/

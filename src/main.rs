@@ -1,4 +1,5 @@
 mod agent;
+mod bridge;
 mod builder;
 mod forest;
 mod sandbox;
@@ -64,6 +65,13 @@ enum Command {
     Ls,
     #[command(about = "Remove the boxes whose checkout or forest is gone, and their state")]
     Prune,
+    #[command(
+        about = "Run the bridge daemon for the boxes: forest ops over TCP JSON lines (see README)"
+    )]
+    Serve {
+        #[arg(long)]
+        port: Option<u16>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -138,6 +146,16 @@ async fn run(command: Command) -> Result<u8> {
         }
         Command::Prune => {
             sandbox::prune().await?;
+            Ok(0)
+        }
+        Command::Serve { port } => {
+            // --port, else BENTO_BRIDGE_PORT (what the boxes were told), else
+            // the default; a bad env value is an error, not a silent port
+            let port = match port {
+                Some(p) => p,
+                None => bridge::port_from_env()?,
+            };
+            bridge::serve(port).await?;
             Ok(0)
         }
         Command::Enter => {
