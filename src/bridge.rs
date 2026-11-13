@@ -353,7 +353,10 @@ fn handle_request(
         return Ok(result);
     }
     let c = caller.as_ref().ok_or_else(|| {
-        BridgeError::new("hello_required", "the first request on a connection must be hello")
+        BridgeError::new(
+            "hello_required",
+            "the first request on a connection must be hello",
+        )
     })?;
     dispatch(c, op, req)
 }
@@ -384,7 +387,10 @@ fn hello(daemon: &Daemon, req: &Value) -> Result<Caller, BridgeError> {
         .filter(|t| !t.is_empty())
         .ok_or_else(|| BridgeError::new("bad_request", "missing string field 'token'"))?;
     let info = lookup_token(&daemon.data_dir, token).ok_or_else(|| {
-        BridgeError::new("unknown_token", "no box has this token; was the box recreated?")
+        BridgeError::new(
+            "unknown_token",
+            "no box has this token; was the box recreated?",
+        )
     })?;
     let path = PathBuf::from(&info.path);
     Ok(Caller {
@@ -604,7 +610,10 @@ fn run_forest(cwd: &Path, args: &[String]) -> Result<Value, BridgeError> {
     } else {
         "failed"
     };
-    Err(BridgeError::new(code, output_tail(&out.stderr, &out.stdout)))
+    Err(BridgeError::new(
+        code,
+        output_tail(&out.stderr, &out.stdout),
+    ))
 }
 
 /// forest's `--json` failure envelope: `{"v":1,"error":{"code","message"}}`.
@@ -697,12 +706,12 @@ fn string_list(req: &Value, key: &str) -> Result<Vec<String>, BridgeError> {
         .ok_or_else(|| BridgeError::new("bad_request", format!("missing list field '{key}'")))?;
     list.iter()
         .map(|v| {
-            v.as_str()
-                .map(String::from)
-                .ok_or_else(|| BridgeError::new(
+            v.as_str().map(String::from).ok_or_else(|| {
+                BridgeError::new(
                     "bad_request",
                     format!("field '{key}' must be a list of strings"),
-                ))
+                )
+            })
         })
         .collect()
 }
@@ -816,7 +825,8 @@ mod tests {
     use super::*;
 
     fn tempdir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("bento-bridge-test-{}-{name}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("bento-bridge-test-{}-{name}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
@@ -954,12 +964,18 @@ mod tests {
         let dir = tempdir("hello");
         let daemon = test_daemon(&dir);
         let mut caller = None;
-        let err = handle_request(&daemon, &mut caller, "forest.ls", &json!({"op": "forest.ls"}))
-            .unwrap_err();
+        let err = handle_request(
+            &daemon,
+            &mut caller,
+            "forest.ls",
+            &json!({"op": "forest.ls"}),
+        )
+        .unwrap_err();
         assert_eq!(err.code, "hello_required");
         assert!(caller.is_none());
         // and a hello with no token does not authenticate anything
-        let err = handle_request(&daemon, &mut caller, "hello", &json!({"op": "hello"})).unwrap_err();
+        let err =
+            handle_request(&daemon, &mut caller, "hello", &json!({"op": "hello"})).unwrap_err();
         assert_eq!(err.code, "bad_request");
         assert!(caller.is_none());
     }
@@ -1013,7 +1029,10 @@ mod tests {
     fn dispatch_table_rejects_what_is_not_implemented() {
         let dir = tempdir("dispatch");
         let caller = caller_at(&dir); // not a workforest: no forests/ layout
-        for (op, code, needle) in [("nope", "unknown_op", "unknown op"), ("gpu.submit", "unknown_op", "G1")] {
+        for (op, code, needle) in [
+            ("nope", "unknown_op", "unknown op"),
+            ("gpu.submit", "unknown_op", "G1"),
+        ] {
             let err = dispatch(&caller, op, &json!({"op": op})).unwrap_err();
             assert_eq!(err.code, code, "{op}");
             assert!(err.message.contains(needle), "{op}: {}", err.message);
@@ -1033,7 +1052,7 @@ mod tests {
     fn forest_ops_validate_their_args() {
         let dir = tempdir("args");
         let caller = caller_at(&dir); // a checkout's box, not a forest's
-        // add and name need a workforest box
+                                      // add and name need a workforest box
         for req in [
             json!({"op": "forest.add", "repos": ["ois"]}),
             json!({"op": "forest.name", "branch": "x"}),
@@ -1044,12 +1063,30 @@ mod tests {
         }
         // new validates names, refs and repos before running anything
         for (req, code) in [
-            (json!({"op": "forest.new", "name": "../x", "repos": ["bento"]}), "bad_request"),
-            (json!({"op": "forest.new", "name": "a:b", "repos": ["bento"]}), "bad_request"),
-            (json!({"op": "forest.new", "name": "ok", "repos": []}), "bad_request"),
-            (json!({"op": "forest.new", "name": "ok", "repos": [17]}), "bad_request"),
-            (json!({"op": "forest.new", "name": "ok", "repos": ["bento"], "from": "-x"}), "bad_request"),
-            (json!({"op": "forest.new", "repos": ["bento"]}), "bad_request"),
+            (
+                json!({"op": "forest.new", "name": "../x", "repos": ["bento"]}),
+                "bad_request",
+            ),
+            (
+                json!({"op": "forest.new", "name": "a:b", "repos": ["bento"]}),
+                "bad_request",
+            ),
+            (
+                json!({"op": "forest.new", "name": "ok", "repos": []}),
+                "bad_request",
+            ),
+            (
+                json!({"op": "forest.new", "name": "ok", "repos": [17]}),
+                "bad_request",
+            ),
+            (
+                json!({"op": "forest.new", "name": "ok", "repos": ["bento"], "from": "-x"}),
+                "bad_request",
+            ),
+            (
+                json!({"op": "forest.new", "repos": ["bento"]}),
+                "bad_request",
+            ),
         ] {
             let err = dispatch(&caller, "forest.new", &req).unwrap_err();
             assert_eq!(err.code, code, "{req}: {}", err.message);
@@ -1061,13 +1098,32 @@ mod tests {
         use super::*;
         assert_eq!(
             new_args("spike-x", &["bento".into(), "ois".into()], Some("master")),
-            ["new", "--no-fetch", "--create-only", "--from=master", "--", "spike-x", "bento", "ois"]
+            [
+                "new",
+                "--no-fetch",
+                "--create-only",
+                "--from=master",
+                "--",
+                "spike-x",
+                "bento",
+                "ois"
+            ]
         );
         assert_eq!(
             new_args("spike-x", &["bento".into()], None),
-            ["new", "--no-fetch", "--create-only", "--", "spike-x", "bento"]
+            [
+                "new",
+                "--no-fetch",
+                "--create-only",
+                "--",
+                "spike-x",
+                "bento"
+            ]
         );
-        assert_eq!(add_args(&["ois".into()]), ["add", "--no-fetch", "--", "ois"]);
+        assert_eq!(
+            add_args(&["ois".into()]),
+            ["add", "--no-fetch", "--", "ois"]
+        );
         assert_eq!(name_args("spike/y"), ["name", "--", "spike/y"]);
         assert_eq!(ls_args(), ["ls"]);
     }
@@ -1132,7 +1188,10 @@ mod tests {
         let stderr: Vec<u8> = std::iter::repeat_n(b'x', 10_000).collect();
         assert_eq!(output_tail(&stderr, b"").len(), 2048);
         // stderr empty: the stdout tail stands in
-        assert_eq!(output_tail(b"", b"use stderr only when empty\n"), "use stderr only when empty");
+        assert_eq!(
+            output_tail(b"", b"use stderr only when empty\n"),
+            "use stderr only when empty"
+        );
     }
 
     #[test]
@@ -1198,7 +1257,10 @@ mod tests {
         // hello: the shape decisions §1 promises
         send(
             &mut client,
-            &format!(r#"{{"op":"hello","token":"{}","client":"test"}}"#, info.token),
+            &format!(
+                r#"{{"op":"hello","token":"{}","client":"test"}}"#,
+                info.token
+            ),
         );
         let reply = recv(&mut client);
         assert_eq!(reply["ok"], true, "{reply}");
