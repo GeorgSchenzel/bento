@@ -296,6 +296,12 @@ fn id_shaped(name: &str) -> bool {
 // others. Protocol and ops: decisions.md §1.
 // ---------------------------------------------------------------------------
 
+/// `bento serve`'s port, made the process's `BENTO_BRIDGE_PORT` so every
+/// box created in this process (handoffs) records the reachable port.
+pub(crate) fn adopt_serve_port(port: u16) {
+    std::env::set_var("BENTO_BRIDGE_PORT", port.to_string());
+}
+
 /// An error as it crosses the wire: `{"ok":false,"error":{code,message}}`.
 /// pub(crate): the GPU queue (src/gpu.rs) builds the same errors.
 #[derive(Debug)]
@@ -340,6 +346,11 @@ struct Daemon {
 /// --user unit later); nothing auto-starts it. Starting it also starts the
 /// GPU job queue (one worker, one job at a time — decisions §6).
 pub async fn serve(port: u16) -> Result<()> {
+    // The port this daemon listens on becomes the process's
+    // BENTO_BRIDGE_PORT (M3): boxes created while it runs — a handoff's
+    // `forest.new` — read it through ensure_box_info, and a `--port` the
+    // env never knew must not leave them pointing at the default.
+    adopt_serve_port(port);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .with_context(|| format!("binding 127.0.0.1:{port}"))?;
     let daemon = Arc::new(Daemon {
@@ -1172,6 +1183,30 @@ mod tests {
         fs::write(boxes.join("broken/bridge.json"), "{").unwrap();
         let e = ensure_box_info(&box_state("b8"), "bento-b8", &dir_of("fresh")).unwrap();
         assert_eq!(e.machine, "fresh");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M3: the port a `bento serve --port N` daemon runs on is adopted as
+    /// the process's BENTO_BRIDGE_PORT, so a box created while it runs (a
+    /// handoff's forest.new) records N in bridge.json — not the default
+    /// the env never mentioned.
+    #[test]
+    fn serve_adopts_its_port_for_boxes_created_later() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let root = tempdir("serve-port");
+        let dir = root.join("thing");
+        fs::create_dir_all(&dir).unwrap();
+        let state = root.join("boxes/x");
+        fs::create_dir_all(&state).unwrap();
+        adopt_serve_port(17780);
+        let info = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(info.port, 17780);
+        // later readers without the env still see the stored port, token kept
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let again = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(again.port, 17780);
+        assert_eq!(again.token, info.token);
         fs::remove_dir_all(&root).unwrap();
     }
 
