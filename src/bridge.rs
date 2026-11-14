@@ -298,6 +298,8 @@ fn id_shaped(name: &str) -> bool {
 
 /// `bento serve`'s port, made the process's `BENTO_BRIDGE_PORT` so every
 /// box created in this process (handoffs) records the reachable port.
+/// Must run before the tokio runtime starts: `set_var` is unsound with
+/// other threads live (M4), so main() calls this, never async code.
 pub(crate) fn adopt_serve_port(port: u16) {
     std::env::set_var("BENTO_BRIDGE_PORT", port.to_string());
 }
@@ -345,12 +347,10 @@ struct Daemon {
 /// Run the bridge daemon until killed. Started by the user (a systemd
 /// --user unit later); nothing auto-starts it. Starting it also starts the
 /// GPU job queue (one worker, one job at a time — decisions §6).
+///
+/// The port was adopted as `BENTO_BRIDGE_PORT` by sync `main` before this
+/// runtime existed (M3/M4); `port` itself only binds the listener.
 pub async fn serve(port: u16) -> Result<()> {
-    // The port this daemon listens on becomes the process's
-    // BENTO_BRIDGE_PORT (M3): boxes created while it runs — a handoff's
-    // `forest.new` — read it through ensure_box_info, and a `--port` the
-    // env never knew must not leave them pointing at the default.
-    adopt_serve_port(port);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .with_context(|| format!("binding 127.0.0.1:{port}"))?;
     let daemon = Arc::new(Daemon {

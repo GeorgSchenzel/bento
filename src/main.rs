@@ -82,9 +82,27 @@ enum BuilderAction {
     Restart,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Cli::parse().command).await {
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    // `bento serve` adopts its port as BENTO_BRIDGE_PORT (M3) so boxes it
+    // creates while running (handoffs) record the reachable port. That has
+    // to happen HERE, before the tokio runtime exists: set_var with worker
+    // threads live is unsound (M4 — Rust makes it unsafe from 2024).
+    if let Command::Serve { port } = &cli.command {
+        let resolved = match port {
+            Some(p) => Ok(*p),
+            None => bridge::port_from_env(),
+        };
+        if let Err(err) = resolved.map(bridge::adopt_serve_port) {
+            eprintln!("error: {err:#}");
+            return ExitCode::FAILURE;
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("starting the tokio runtime");
+    match runtime.block_on(run(cli.command)) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
             eprintln!("error: {err:#}");
@@ -153,13 +171,12 @@ async fn run(command: Command) -> Result<u8> {
             sandbox::prune().await?;
             Ok(0)
         }
-        Command::Serve { port } => {
-            // --port, else BENTO_BRIDGE_PORT (what the boxes were told), else
-            // the default; a bad env value is an error, not a silent port
-            let port = match port {
-                Some(p) => p,
-                None => bridge::port_from_env()?,
-            };
+        Command::Serve { .. } => {
+            // main() resolved the port (--port, else BENTO_BRIDGE_PORT,
+            // else the default; a bad env value is an error, not a silent
+            // port) and adopted it into the env before the runtime started,
+            // so boxes created by handoffs record it. Read it back.
+            let port = bridge::port_from_env()?;
             bridge::serve(port).await?;
             Ok(0)
         }
