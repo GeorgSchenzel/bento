@@ -246,6 +246,21 @@ J2 git status >/dev/null 2>&1 && bad "git status in a checkout fails (no gitdir)
 J2 git commit -am x >/dev/null 2>&1 && bad "git commit from the jail is impossible" || ok "git commit from the jail is impossible"
 J2 bash -c '[ -f .git ]' && ok "the checkout's .git gitfile itself is still there (harmless)" || bad "the checkout's .git gitfile itself is still there"
 
+# ---- 8b. a checkout with a real .git DIRECTORY: overlayed by a tmpfs (M5) -----
+# Worktrees have a .git FILE (harmless). A checkout that is a plain clone has
+# a real .git dir — the heart of the repo — and the forest bind would expose
+# it rw to the job. The jail overlays each with a tmpfs: writes stay in RAM,
+# the real contents are invisible.
+mkdir -p "$FOREST/repo2/.git"
+echo "real gitdir content" > "$FOREST/repo2/.git/HEAD-marker"
+J bash -c "echo pwn > '$FOREST/repo2/.git/pwned'" 2>/dev/null \
+  && ok "a checkout's .git dir is writable in jail (tmpfs)" || bad "a checkout's .git dir is writable in jail (tmpfs)"
+[ ! -e "$FOREST/repo2/.git/pwned" ] \
+  && ok "writes into a checkout .git never reach the host (tmpfs overlay)" \
+  || bad "a job wrote into a checkout's real .git"
+J bash -c "[ ! -e '$FOREST/repo2/.git/HEAD-marker' ]" \
+  && ok "the real .git contents are hidden in the jail" || bad "real .git contents visible in jail"
+
 # ---- summary ------------------------------------------------------------
 echo
 echo "---- $pass passed, $fail failed, $skipped skipped (display: $([ "$REAL" = 1 ] && echo real || echo headless))"

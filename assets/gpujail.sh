@@ -61,6 +61,9 @@
 #   $scratch          -> $HOME       rw    ephemeral home (fontconfig/mesa/nvidia shader caches);
 #                                           host mktemp -d, deleted after the job (see cleanup)
 #   $forest           -> $forest     rw    THE point: the forest's files, same path as on host
+#   <tree>/.git       -> itself     new   tmpfs over each checkout's real .git dir (a plain
+#                                            clone's gitdir: no reads, no planted commits/hooks);
+#                                            worktree .git FILEs are pointers, left alone
 #   /run              -> /run        new   tmpfs hides /run/user/<uid> (secrets, agent sockets);
 #                                           headless mode also puts the job's compositor runtime
 #                                           dir on it (writable, gone with the jail)
@@ -185,6 +188,20 @@ else
   set -- bash -c "$HEADLESS_WRAPPER" gpujob "$@"
 fi
 
+# Overlay every checkout's real .git DIRECTORY with a tmpfs (M5). Worktrees
+# have a .git FILE (a pointer to a hidden gitdir) — harmless, left alone. A
+# checkout that is a plain clone has the real gitdir inside the forest, and
+# the rw bind below would hand it to the job: it could read the repo's
+# objects, plant commits, or write hooks. The tmpfs keeps the path (git in
+# the jail sees an empty .git = not a repository) while the real contents
+# stay on the host, untouched. Symlinked .git entries are skipped, not
+# followed (bwrap resolves mount targets through symlinks).
+git_overlays=()
+for d in "$forest"/*/; do
+  [ -d "$d.git" ] && [ ! -L "$d.git" ] || continue
+  git_overlays+=(--tmpfs "${d%/}/.git")
+done
+
 env_job=()
 [ -n "${GPU_JOB_DIR:-}" ] && env_job+=(--setenv GPU_JOB_DIR "$GPU_JOB_DIR")
 [ -n "${GPU_JOB_FILES:-}" ] && env_job+=(--setenv GPU_JOB_FILES "$GPU_JOB_FILES")
@@ -213,6 +230,7 @@ env_job=()
   "${display_binds[@]}" \
   --tmpfs /tmp \
   --bind "$forest" "$forest" \
+  "${git_overlays[@]}" \
   --tmpfs /nix/var \
   --proc /proc \
   --unshare-net \
