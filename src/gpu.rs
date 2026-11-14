@@ -306,9 +306,14 @@ impl Queue {
             .into_iter()
             .flatten()
             .flatten()
+            // lossy + strip_suffix: never index a lossy string by the OsStr's
+            // byte length — a non-UTF8 name in queued/ would slice mid-char
+            // and panic the connection thread (found in review)
             .filter(|e| {
-                e.file_name().to_string_lossy().ends_with(".json")
-                    && e.file_name().to_string_lossy()[..e.file_name().len() - 5].lt(id)
+                e.file_name()
+                    .to_string_lossy()
+                    .strip_suffix(".json")
+                    .is_some_and(|other| other.lt(id))
             })
             .count()
     }
@@ -946,6 +951,44 @@ mod tests {
             "250"
         );
         // a queued job survives recovery untouched
+    }
+
+    #[test]
+    fn queued_before_survives_corrupt_names() {
+        let state = tempdir("qb");
+        for stage in ["queued", "running", "done"] {
+            fs::create_dir_all(state.join(stage)).unwrap();
+        }
+        let queue = Queue {
+            state: state.clone(),
+            inner: Arc::new((Mutex::new(false), Condvar::new())),
+        };
+        // a corrupt non-UTF8 name in queued/ (torn state dir) must not panic
+        use std::os::unix::ffi::OsStringExt as _;
+        let bad = state
+            .join("queued")
+            .join(std::ffi::OsString::from_vec(b"\xffx.json".to_vec()));
+        fs::write(&bad, "{}").unwrap();
+        // a well-formed earlier job still counts; the bad name (replacement
+        // char sorts after digits) does not
+        let job = |id: &str| Job {
+            id: id.into(),
+            forest: "/tmp/f".into(),
+            checkout: "/tmp/f/a".into(),
+            tree: "a".into(),
+            cwd: "a".into(),
+            cmd: "true".into(),
+            timeout_s: 10,
+            dir: "/tmp/f/a/.gpu-jobs".into(),
+            queued_at: 1,
+            started_at: None,
+            finished_at: None,
+            exit: None,
+            timed_out: None,
+        };
+        job("20261113-000100-0000").save(&state.join("queued")).unwrap();
+        assert_eq!(queue.queued_before("20261113-235959-zzzz"), 1);
+        let _ = fs::remove_file(&bad);
     }
 
     #[test]
