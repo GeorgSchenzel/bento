@@ -178,6 +178,19 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
                 format!("{git}/worktrees/{}/gitdir", wt.wt_id),
                 back,
             ));
+            // The main git dir is writable so commits write objects and
+            // refs on the host — but never the parts host-side git would
+            // execute from (config: core.fsmonitor/hooksPath; hooks/;
+            // info/attributes), or the worktree's config.worktree.
+            mounts.extend(git_shadows(&git, &wt.main_git, Some(&wt.wt_id)));
+        } else if tree.dir.join(".git").is_dir() {
+            // A main checkout's git dir sits inside its tree bind; the same
+            // host-executable parts stay read-only there too.
+            mounts.extend(git_shadows(
+                &format!("{guest}/.git"),
+                &tree.dir.join(".git"),
+                None,
+            ));
         }
     }
     mounts.push(Mount::ro(
@@ -196,6 +209,34 @@ fn mounts(forest: &Forest, nix: &Path, home: &Path, state: &Path) -> Result<Vec<
     ));
     mounts.extend(agent::mounts(home, state, forest.quota_mib())?);
     Ok(mounts)
+}
+
+/// Read-only shadows over a writable git-dir bind: the parts host-side git
+/// would execute from — `config` (a `core.fsmonitor` or `core.hooksPath`
+/// planted in a box), `hooks/`, `info/` (attributes run diff drivers) and,
+/// for a linked worktree, its `config.worktree` — stay host-controlled. The
+/// same mechanism as the generated pointer files: a later, more specific
+/// bind shadows the writable one. Missing host paths are skipped (nothing
+/// to shadow); everything else in the git dir stays writable, so commits
+/// (objects, refs, the worktree's HEAD and index) still reach the host.
+fn git_shadows(guest_git: &str, host_git: &Path, wt: Option<&str>) -> Vec<Mount> {
+    let mut mounts = Vec::new();
+    for name in ["config", "hooks", "info"] {
+        let host = host_git.join(name);
+        if host.exists() {
+            mounts.push(Mount::ro(format!("{guest_git}/{name}"), host));
+        }
+    }
+    if let Some(id) = wt {
+        let host = host_git.join("worktrees").join(id).join("config.worktree");
+        if host.exists() {
+            mounts.push(Mount::ro(
+                format!("{guest_git}/worktrees/{id}/config.worktree"),
+                host,
+            ));
+        }
+    }
+    mounts
 }
 
 /// Older boxes generated a combined devenv at the forest root; drop it so
@@ -247,6 +288,10 @@ running as root with full network access. Experiment freely.
 These are the user's live files: edits show up on their machine right away,
 and `git commit` lands in their repo. `git push` doesn't work; leave that to
 the user. Files outside the checkouts never leave the box.
+
+Each repo's git config, hooks and info dirs are read-only here (host-side
+git would run code planted in them); commits, branches and worktree reads
+work as usual, `git config`/new hooks in the repo do not.
 
 ## Tools
 
@@ -679,6 +724,173 @@ async fn remove(name: &str) -> Result<Option<u64>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// What a shadowed git dir's mounts are: every one read-only, guest
+    /// path under the git dir, host path the real file.
+    fn shadow_pairs(mounts: &[Mount]) -> Vec<(String, PathBuf, bool)> {
+        mounts
+            .iter()
+            .map(|m| {
+                let ro = matches!(m.kind, MountKind::Ro);
+                (m.guest.clone(), m.host.clone(), ro)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn git_shadows_cover_the_host_executable_parts() {
+        let base = std::env::temp_dir().join(format!("bento-shadows-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        // a git dir as a linked worktree's main dir looks: config, hooks/,
+        // info/, worktrees/<id>/{gitdir,config.worktree}
+        let git = base.join("main").join(".git");
+        for dir in ["hooks", "info", "worktrees/wt-1", "objects"] {
+            fs::create_dir_all(git.join(dir)).unwrap();
+        }
+        fs::write(git.join("config"), "[core]\n").unwrap();
+        fs::write(git.join("worktrees/wt-1/config.worktree"), "[core]\n").unwrap();
+
+        let mounts = git_shadows("/git/x", &git, Some("wt-1"));
+        assert_eq!(
+            shadow_pairs(&mounts),
+            [
+                ("/git/x/config".into(), git.join("config"), true),
+                ("/git/x/hooks".into(), git.join("hooks"), true),
+                ("/git/x/info".into(), git.join("info"), true),
+                (
+                    "/git/x/worktrees/wt-1/config.worktree".into(),
+                    git.join("worktrees/wt-1/config.worktree"),
+                    true
+                ),
+            ]
+        );
+
+        // without a config.worktree (the usual case), without it in the list
+        fs::remove_file(git.join("worktrees/wt-1/config.worktree")).unwrap();
+        let mounts = git_shadows("/git/x", &git, Some("wt-1"));
+        assert_eq!(shadow_pairs(&mounts).len(), 3);
+        // a main checkout: no worktree id, nothing skipped
+        let mounts = git_shadows("/workspace/x/.git", &git, None);
+        assert_eq!(
+            shadow_pairs(&mounts)[0],
+            ("/workspace/x/.git/config".into(), git.join("config"), true)
+        );
+        assert!(shadow_pairs(&mounts)
+            .iter()
+            .all(|(g, _, _)| !g.contains("config.worktree")));
+        // a bare-ish git dir missing hooks/info: only what exists is bound
+        fs::remove_dir_all(git.join("hooks")).unwrap();
+        fs::remove_dir_all(git.join("info")).unwrap();
+        let mounts = git_shadows("/git/x", &git, Some("wt-1"));
+        assert_eq!(shadow_pairs(&mounts).len(), 1);
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The shadows are safe to add because git writes config, hooks and
+    /// info only for config-ish commands: commits, branch moves and
+    /// worktree reads leave them byte-identical (so a read-only bind
+    /// changes nothing for them), while `git config` — the thing the
+    /// shadows stop — does write.
+    #[test]
+    fn git_never_writes_config_hooks_or_info_for_normal_work() {
+        let base = std::env::temp_dir().join(format!("bento-gitwrite-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("gitconfig"),
+            "[user]\nname = T\nemail = t@example.com\n[init]\ndefaultBranch = main\n",
+        )
+        .unwrap();
+        let repo = base.join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        run(&base, &repo, &["init", "-q"]);
+        run(
+            &base,
+            &repo,
+            &["commit", "-q", "--allow-empty", "-m", "first"],
+        );
+        let wt = base.join("wt");
+        run(
+            &base,
+            &repo,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "--no-track",
+                "-b",
+                "feat",
+                &wt.display().to_string(),
+            ],
+        );
+        let parts = |dir: &Path| -> Vec<(String, String)> {
+            let mut seen = Vec::new();
+            for name in ["config", "hooks", "info"] {
+                let path = dir.join(".git").join(name);
+                seen.push((
+                    name.to_string(),
+                    fs::read_to_string(&path).unwrap_or_default(),
+                ));
+            }
+            seen
+        };
+        let main_before = parts(&repo);
+        let wt_dir = fs::read_to_string(wt.join(".git"))
+            .unwrap()
+            .trim()
+            .trim_start_matches("gitdir:")
+            .trim()
+            .to_string();
+        let wt_before = parts(Path::new(&wt_dir));
+
+        // the work git does in a box: commit, move the branch, read worktrees
+        run(
+            &base,
+            &wt,
+            &["commit", "-q", "--allow-empty", "-m", "second"],
+        );
+        run(&base, &wt, &["branch", "-m", "feat", "feat2"]);
+        run(&base, &wt, &["worktree", "list"]);
+        run(&base, &wt, &["status", "--porcelain"]);
+
+        assert_eq!(
+            parts(&repo),
+            main_before,
+            "main git dir's config/hooks/info changed"
+        );
+        assert_eq!(
+            parts(Path::new(&wt_dir)),
+            wt_before,
+            "worktree git dir changed"
+        );
+
+        // and the write the shadows exist to stop: git config does write
+        run(&base, &wt, &["config", "user.name", "Pwned"]);
+        assert_ne!(
+            parts(&repo),
+            main_before,
+            "git config must be the blocked write"
+        );
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// Plain git, hermetic against the host's config; asserts success.
+    fn run(base: &Path, dir: &Path, args: &[&str]) -> String {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", base.join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("running git");
+        assert!(
+            out.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    }
 
     #[test]
     fn bridge_env_leaves_no_fingerprint_trace() {

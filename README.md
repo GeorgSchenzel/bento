@@ -108,7 +108,11 @@ command and GPU-job queueing are client calls to it (TCP, JSON lines,
 Started by the user, e.g. `bento serve --port 17761 &`; nothing
 auto-starts it.
 
-- Port: `--port`, else `$BENTO_BRIDGE_PORT`, else 17761.
+- Port: `--port`, else `$BENTO_BRIDGE_PORT`, else 17761. The port becomes
+  the process's `BENTO_BRIDGE_PORT`, so boxes created by a handoff record
+  the port this daemon actually listens on; an explicit
+  `$BENTO_BRIDGE_PORT` rewrites a differing stored port in a box's
+  `bridge.json` (the token is kept).
 - Every box carries its identity in the env: `BENTO_BRIDGE` (the daemon's
   `host:port`), `BENTO_BRIDGE_TOKEN` (a random 128-bit token, generated
   once per box, kept in `~/.local/share/bento/boxes/<box>/bridge.json`
@@ -197,11 +201,14 @@ workforest box as a machine on the host's hc core when it creates it
 (`bento start`), so `hc ls` on the host lists and drives the agents of
 every forest: `hc run --on <forest-name> --cwd /workspace opencode "<task>"`.
 The machine name is the forest dir's name (`spike-x` → machine `spike-x`,
-kept in the box's `bridge.json`), and its via line is `<msb> exec --stream
+kept in the box's `bridge.json`), made unique across boxes with a `-2`,
+`-3`, … suffix when another box's bridge.json already claims it, and its
+via line is `<msb> exec --stream
 <box> -- sh -c` — byte-exact stdio without a PTY, and never `bento exec`,
 which would start or even recreate stopped or removed boxes from hc's
-reconnect loop. Registration replaces any entry of the same name and only
-warns on failure; `bento rm` and `bento prune` remove the machine entry.
+reconnect loop. Registration replaces any entry of the same name — never
+one another box still claims — and only warns on failure; `bento rm` and
+`bento prune` remove the machine entry.
 Boxes of single checkouts are not registered.
 
 Without `BENTO_HC` nothing touches any hc core (no PATH fallback). Test

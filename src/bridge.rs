@@ -26,6 +26,8 @@ use crate::util;
 /// Default daemon port, next to the builder's 17760.
 pub const DEFAULT_PORT: u16 = 17761;
 
+/// hc caps machine names at 32 chars (addr.rs `clean_name`).
+pub const MAX_MACHINE: usize = 32;
 /// How boxes address the host: msb rewrites the gateway to the host's
 /// loopback (R2: the only path boxes are guaranteed to reach; the LAN IP
 /// is not reachable from a box).
@@ -55,11 +57,21 @@ pub struct BoxInfo {
 /// an error, not a silent fallback — a typo'd port would point boxes at
 /// nothing.
 pub fn port_from_env() -> Result<u16> {
+    match env_port()? {
+        Some(p) => Ok(p),
+        None => Ok(DEFAULT_PORT),
+    }
+}
+
+/// `BENTO_BRIDGE_PORT` as `Some(port)`, `None` when unset. Callers decide
+/// whether an unset var means the default or "keep what is stored".
+fn env_port() -> Result<Option<u16>> {
     match std::env::var("BENTO_BRIDGE_PORT") {
         Ok(v) => v
             .parse()
+            .map(Some)
             .with_context(|| format!("bad BENTO_BRIDGE_PORT '{v}'")),
-        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_PORT),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(e) => Err(e).context("reading BENTO_BRIDGE_PORT"),
     }
 }
@@ -67,10 +79,38 @@ pub fn port_from_env() -> Result<u16> {
 /// The box's bridge.json, read or created. The token is fixed once per box
 /// and reused, so it survives box recreation (`bento start`) without the
 /// env plumbing changing under a running setup.
+///
+/// The port follows the daemon when the caller knows it: an explicit
+/// `BENTO_BRIDGE_PORT` rewrites a stored port that differs, so a moved
+/// daemon reaches its boxes after their next `bento start`. Without the
+/// env var the stored port stays as it is; when it is not the default, a
+/// warning says what the box expects — exactly the case where starting
+/// `bento serve` plain makes every box look offline.
 pub fn ensure_box_info(state: &Path, box_name: &str, dir: &Path) -> Result<BoxInfo> {
     let path = state.join("bridge.json");
+    let port = env_port()?;
     if let Ok(text) = fs::read_to_string(&path) {
-        if let Ok(info) = serde_json::from_str(&text) {
+        if let Ok(mut info) = serde_json::from_str::<BoxInfo>(&text) {
+            match port {
+                Some(p) if p != info.port => {
+                    eprintln!(
+                        "bento: box '{box_name}' bridge port {} -> {p} (BENTO_BRIDGE_PORT); \
+                         `bento start` applies it to a running box",
+                        info.port
+                    );
+                    info.port = p;
+                    write_secret(&path, &serde_json::to_vec_pretty(&info)?)?;
+                }
+                Some(_) => {}
+                None if info.port != DEFAULT_PORT => {
+                    eprintln!(
+                        "bento: box '{box_name}' expects the bridge on port {} (not the default {}); \
+                         start `bento serve --port {}` or export BENTO_BRIDGE_PORT={}",
+                        info.port, DEFAULT_PORT, info.port, info.port
+                    );
+                }
+                None => {}
+            }
             return Ok(info);
         }
         // unreadable or corrupt: fall through and regenerate (a fresh token
@@ -80,11 +120,82 @@ pub fn ensure_box_info(state: &Path, box_name: &str, dir: &Path) -> Result<BoxIn
         token: random_token().context("generating the bridge token")?,
         box_name: box_name.to_string(),
         path: dir.display().to_string(),
-        port: port_from_env()?,
-        machine: machine_name(&dir_name(dir)),
+        port: port.unwrap_or(DEFAULT_PORT),
+        machine: unique_machine(state, &dir_name(dir))?,
     };
     write_secret(&path, &serde_json::to_vec_pretty(&info)?)?;
     Ok(info)
+}
+
+/// The machine name for a new box: the derived name unless another box's
+/// bridge.json claims it, then `-2`, `-3`, … — hc routes by name, so a
+/// collision would let one box's registration remove another's machine
+/// (M2). The base is truncated to keep the suffixed name inside hc's 32
+/// chars; the suffix also breaks terminal-id shapes (`-` is not in hc's
+/// id alphabet). Sibling state dirs with unreadable bridge.json files are
+/// skipped: the worst case is a duplicate, the same as before.
+fn unique_machine(state: &Path, dir_name: &str) -> Result<String> {
+    let base = machine_name(dir_name);
+    let taken = machines_of_other_boxes(state);
+    if !taken.contains(&base) {
+        return Ok(base);
+    }
+    for n in 2u32.. {
+        let suffix = format!("-{n}");
+        // machine_name output is ASCII, so cutting bytes cuts chars
+        let cut = MAX_MACHINE.saturating_sub(suffix.len());
+        let candidate = format!("{}{suffix}", &base[..base.len().min(cut)]);
+        if !taken.contains(&candidate) {
+            return Ok(candidate);
+        }
+        if n > 9_999 {
+            return Err(anyhow!(
+                "no free machine name for '{}' after {n} boxes",
+                dir_name
+            ));
+        }
+    }
+    unreachable!()
+}
+
+/// Which machine name another box's bridge.json claims: the claiming box's
+/// name, when there is one. `own_state` (this box's state dir) is excluded;
+/// `machine` is checked as-is, so a pre-uniqueness duplicate is visible to
+/// both sides. Used by herdr's register/unregister to never remove a
+/// machine another box still owns.
+pub fn machine_owner(own_state: &Path, machine: &str) -> Option<String> {
+    machines_with_owners(own_state)
+        .into_iter()
+        .find(|(m, _)| m == machine)
+        .map(|(_, owner)| owner)
+}
+
+fn machines_with_owners(own_state: &Path) -> Vec<(String, String)> {
+    let Some(boxes) = own_state.parent() else {
+        return Vec::new();
+    };
+    let mut found = Vec::new();
+    for entry in fs::read_dir(boxes).ok().into_iter().flatten().flatten() {
+        let state = entry.path();
+        if state == own_state {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(state.join("bridge.json")) else {
+            continue; // a box being removed, or mid-write
+        };
+        let Ok(info) = serde_json::from_str::<BoxInfo>(&text) else {
+            continue; // corrupt: never fatal
+        };
+        found.push((info.machine, info.box_name));
+    }
+    found
+}
+
+fn machines_of_other_boxes(state: &Path) -> std::collections::BTreeSet<String> {
+    machines_with_owners(state)
+        .into_iter()
+        .map(|(m, _)| m)
+        .collect()
 }
 
 /// A fresh 128-bit token, hex, straight from the kernel.
@@ -149,14 +260,14 @@ pub fn machine_name(dir_name: &str) -> String {
     let mut name: String = mapped
         .trim_start_matches(|c: char| !c.is_ascii_alphanumeric())
         .chars()
-        .take(32)
+        .take(MAX_MACHINE)
         .collect();
     if name.is_empty() {
         return "box".into();
     }
     if id_shaped(&name) {
-        if name.len() >= 32 {
-            name.truncate(31);
+        if name.len() >= MAX_MACHINE {
+            name.truncate(MAX_MACHINE - 1);
         }
         name.push('-');
     }
@@ -184,6 +295,12 @@ fn id_shaped(name: &str) -> bool {
 // One thread per connection, so a slow forest command never blocks the
 // others. Protocol and ops: decisions.md §1.
 // ---------------------------------------------------------------------------
+
+/// `bento serve`'s port, made the process's `BENTO_BRIDGE_PORT` so every
+/// box created in this process (handoffs) records the reachable port.
+pub(crate) fn adopt_serve_port(port: u16) {
+    std::env::set_var("BENTO_BRIDGE_PORT", port.to_string());
+}
 
 /// An error as it crosses the wire: `{"ok":false,"error":{code,message}}`.
 /// pub(crate): the GPU queue (src/gpu.rs) builds the same errors.
@@ -229,6 +346,11 @@ struct Daemon {
 /// --user unit later); nothing auto-starts it. Starting it also starts the
 /// GPU job queue (one worker, one job at a time — decisions §6).
 pub async fn serve(port: u16) -> Result<()> {
+    // The port this daemon listens on becomes the process's
+    // BENTO_BRIDGE_PORT (M3): boxes created while it runs — a handoff's
+    // `forest.new` — read it through ensure_box_info, and a `--port` the
+    // env never knew must not leave them pointing at the default.
+    adopt_serve_port(port);
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
         .with_context(|| format!("binding 127.0.0.1:{port}"))?;
     let daemon = Arc::new(Daemon {
@@ -983,6 +1105,15 @@ fn write_reply(writer: &mut TcpStream, reply: &Value) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Tests that read or write BENTO_BRIDGE_PORT hold this: cargo runs
+    /// the tests of one binary in parallel threads with one environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Poisoned only by a panicked holder; the next test can still run.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn tempdir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("bento-bridge-test-{}-{name}", std::process::id()));
@@ -1012,6 +1143,150 @@ mod tests {
         assert_eq!(machine_name("..."), "box");
     }
 
+    /// A second box of the same dir name gets a suffixed machine (M2): hc
+    /// routes by name, and a duplicate would let one box's registration
+    /// remove another's machine. The suffix stays inside hc's 32 chars and
+    /// breaks terminal-id shapes.
+    #[test]
+    fn machine_names_are_unique_across_boxes() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let root = tempdir("uniq");
+        let (boxes, dirs) = (root.join("boxes"), root.join("dirs"));
+        fs::create_dir_all(&boxes).unwrap();
+        let dir_of = |n: &str| {
+            let d = dirs.join(n);
+            fs::create_dir_all(&d).unwrap();
+            d
+        };
+        let box_state = |n: &str| {
+            let s = boxes.join(n);
+            fs::create_dir_all(&s).unwrap();
+            s
+        };
+        let first = ensure_box_info(&box_state("b1"), "bento-b1", &dir_of("thing")).unwrap();
+        assert_eq!(first.machine, "thing");
+        let second = ensure_box_info(&box_state("b2"), "bento-b2", &dir_of("thing")).unwrap();
+        assert_eq!(second.machine, "thing-2");
+        let third = ensure_box_info(&box_state("b3"), "bento-b3", &dir_of("Thing")).unwrap();
+        assert_eq!(third.machine, "thing-3"); // case is not a difference
+
+        // a long name: the base is truncated so base+suffix fits in 32
+        let long = "l".repeat(40);
+        let a = ensure_box_info(&box_state("b4"), "bento-b4", &dir_of(&long)).unwrap();
+        assert_eq!(a.machine.len(), 32);
+        let b = ensure_box_info(&box_state("b5"), "bento-b5", &dir_of(&long)).unwrap();
+        assert_eq!(b.machine.len(), 32, "suffixed name must stay within 32");
+        assert_ne!(a.machine, b.machine);
+        assert_eq!(&b.machine[..30], &a.machine[..30]);
+
+        // id-shaped names stay non-id-shaped with a suffix
+        let c = ensure_box_info(&box_state("b6"), "bento-b6", &dir_of("t12")).unwrap();
+        assert_eq!(c.machine, "t12-");
+        let d = ensure_box_info(&box_state("b7"), "bento-b7", &dir_of("t12")).unwrap();
+        assert_eq!(d.machine, "t12--2");
+        assert!(!id_shaped(&d.machine));
+
+        // a box with a corrupt bridge.json does not block a name
+        fs::create_dir_all(boxes.join("broken")).unwrap();
+        fs::write(boxes.join("broken/bridge.json"), "{").unwrap();
+        let e = ensure_box_info(&box_state("b8"), "bento-b8", &dir_of("fresh")).unwrap();
+        assert_eq!(e.machine, "fresh");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M3: the port a `bento serve --port N` daemon runs on is adopted as
+    /// the process's BENTO_BRIDGE_PORT, so a box created while it runs (a
+    /// handoff's forest.new) records N in bridge.json — not the default
+    /// the env never mentioned.
+    #[test]
+    fn serve_adopts_its_port_for_boxes_created_later() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let root = tempdir("serve-port");
+        let dir = root.join("thing");
+        fs::create_dir_all(&dir).unwrap();
+        let state = root.join("boxes/x");
+        fs::create_dir_all(&state).unwrap();
+        adopt_serve_port(17780);
+        let info = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(info.port, 17780);
+        // later readers without the env still see the stored port, token kept
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let again = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(again.port, 17780);
+        assert_eq!(again.token, info.token);
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M4: an explicit BENTO_BRIDGE_PORT updates an existing bridge.json
+    /// (the daemon moved); without it the stored port stays; a bad value is
+    /// an error even when the file is there, and never changes it.
+    #[test]
+    fn an_explicit_port_follows_the_daemon() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let root = tempdir("port-follow");
+        let dir = root.join("thing");
+        fs::create_dir_all(&dir).unwrap();
+        let state = root.join("boxes/x");
+        fs::create_dir_all(&state).unwrap();
+        let first = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(first.port, DEFAULT_PORT);
+
+        std::env::set_var("BENTO_BRIDGE_PORT", "17800");
+        let second = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(second.port, 17800);
+        assert_eq!(second.token, first.token, "only the port is rewritten");
+
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let third = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(third.port, 17800, "without the env, the stored port stays");
+
+        std::env::set_var("BENTO_BRIDGE_PORT", "not-a-port");
+        let err = ensure_box_info(&state, "bento-x", &dir).unwrap_err();
+        assert!(err.to_string().contains("BENTO_BRIDGE_PORT"), "{err:#}");
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let fourth = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(fourth.port, 17800, "a bad value leaves the file alone");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The M2 guard herdr's register/unregister use: a machine another
+    /// box's bridge.json claims has that box's name on it — whichever side
+    /// asks.
+    #[test]
+    fn machine_owner_names_the_other_box() {
+        let boxes = tempdir("owner").join("boxes");
+        for (name, machine) in [("a", "thing"), ("b", "thing"), ("c", "other")] {
+            let state = boxes.join(name);
+            fs::create_dir_all(&state).unwrap();
+            fs::write(
+                state.join("bridge.json"),
+                serde_json::to_string(&BoxInfo {
+                    token: format!("t-{name}"),
+                    box_name: format!("bento-{name}"),
+                    path: "/tmp".into(),
+                    port: 17761,
+                    machine: machine.into(),
+                })
+                .unwrap(),
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            machine_owner(&boxes.join("a"), "thing").as_deref(),
+            Some("bento-b")
+        );
+        assert_eq!(
+            machine_owner(&boxes.join("b"), "thing").as_deref(),
+            Some("bento-a")
+        );
+        // own claims are invisible, unknown machines have no owner
+        assert_eq!(machine_owner(&boxes.join("c"), "other"), None);
+        assert_eq!(machine_owner(&boxes.join("a"), "nope"), None);
+    }
+
     #[test]
     fn workforest_needs_the_layout() {
         let root = tempdir("wf");
@@ -1029,9 +1304,15 @@ mod tests {
 
     #[test]
     fn box_info_is_created_once_and_secret() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
         use std::os::unix::fs::PermissionsExt as _;
-        let state = tempdir("state");
-        let dir = state.join("tree");
+        let root = tempdir("state");
+        // under a boxes/ dir, like the real layout: the uniqueness scan
+        // reads the state dir's siblings
+        let state = root.join("boxes/bento-test");
+        fs::create_dir_all(&state).unwrap();
+        let dir = root.join("tree");
         fs::create_dir_all(&dir).unwrap();
         let first = ensure_box_info(&state, "bento-test", &dir).unwrap();
         assert_eq!(first.token.len(), 32);
@@ -1051,6 +1332,7 @@ mod tests {
         let third = ensure_box_info(&state, "bento-test", &dir).unwrap();
         assert_eq!(third.token.len(), 32);
         assert_ne!(third.token, second.token);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     // --- the daemon ---
