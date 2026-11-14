@@ -1234,7 +1234,7 @@ mod tests {
         let dir = tempdir("sock");
         let root = dir.join("root");
         let forest_dir = root.join("forests").join("thing");
-        fs::create_dir_all(&root.join("repos")).unwrap();
+        fs::create_dir_all(root.join("repos")).unwrap();
         fs::create_dir_all(&forest_dir).unwrap();
         let info = BoxInfo {
             token: "ab".repeat(16),

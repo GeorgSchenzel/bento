@@ -256,7 +256,8 @@ bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:
 
 - The builder is the only process that writes to the store. Locks don't
   work across microsandbox VMs, so two VMs writing the same store corrupt it.
-- The box tools (claude-code, opencode, devenv, docker, git, just, python3, uv, socat, ncurses) come from a
+- The box tools (claude-code, opencode, devenv, docker, git, just, python3, uv, socat, ncurses,
+  herdr-core as `hc` for running agents, and the `forest` client for the bridge) come from a
   flake that is embedded in the binary (`tools/`). The builder builds it
   into the GC root `/nix/var/nix/gcroots/bento/tools`, and boxes have its
   `bin/` on PATH. Changing the flake rebuilds the tools on the next command.
