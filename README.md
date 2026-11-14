@@ -150,12 +150,28 @@ land in `<forest>/<checkout>/.gpu-jobs/<id>/` (`cmd`, `stdout`, `stderr`,
 `exit` written last, `timed-out`, `files/` — the job's `$GPU_JOB_FILES`),
 readable from the box at `/workspace/<checkout>/.gpu-jobs/<id>`.
 
+- **Two result stores**: `.gpu-jobs/` is writable by the box and by the
+  job, so the daemon keeps the authoritative results in its own
+  `$BENTO_GPU_STATE/out/<id>/` (stdout/stderr pipes, `exit`, `timed-out`;
+  `gpu.status` tails from there) and only *copies* them into the checkout
+  with `openat` + `O_NOFOLLOW` at every hop and `O_CREAT|O_EXCL` files —
+  a symlink planted anywhere on that walk skips the copy (never follows),
+  recorded in the job and shown by `gpu.status` as
+  `results_copied`/`results_error`. `files/` alone is written by the job
+  inside the jail.
 - The jail (bubblewrap, `assets/gpujail.sh`, embedded into the binary and
   written to the state dir on `bento serve`): no network, only the forest's
   files writable, `~/.ssh`/other forests/`~/projects/repos`/credentials
-  invisible, GPU (`/dev/dri` + NVIDIA nodes) and a display available.
-  Properties are re-verified by `assets/test-gpujail.sh` (headless and
-  real-display mode).
+  invisible, `/var` `/srv` `/mnt` `/media` private tmpfs, every checkout's
+  real `.git` dir overlayed by a tmpfs, no controlling tty
+  (`--new-session`), stdin from `/dev/null`, GPU (`/dev/dri` + NVIDIA
+  nodes) and a display available. Properties are re-verified by
+  `assets/test-gpujail.sh` (headless and real-display mode).
+- **One daemon per state dir** (`flock` on `$BENTO_GPU_STATE/lock`); jobs
+  run in their own process group with `PR_SET_PDEATHSIG`, so a daemon
+  crash kills the running job, and the next daemon's startup kills any
+  recorded leftover group before marking the job exit 250. Job records
+  are written atomically (temp + rename).
 - **Display**: by default each job gets its own **headless compositor**
   (sway, `WLR_BACKENDS=headless`, on the real GPU) inside the jail — the
   user's real wayland/X11 sockets are not bound, so jobs can neither
@@ -165,11 +181,14 @@ readable from the box at `/workspace/<checkout>/.gpu-jobs/<id>`.
   the daemon restores R5's real-display binding for such cases.
 - State: `$BENTO_GPU_STATE` (default `~/.local/share/bento/gpu/`) holds
   `{queued,running,done}/<id>.json` (claim by rename; a job found `running`
-  at daemon startup is marked exit 250) and the extracted `gpujail.sh`.
-- Safety (decisions.md §1): the submitted `cwd` must realpath inside a
-  checkout of the caller's forest (no `..`, no absolute, no symlinked
-  `.gpu-jobs`/job dirs); `gpu.status`/`gpu.ls` only show the caller's own
-  jobs; the command reaches the jail as argv, never through a host shell.
+  at daemon startup is killed and marked exit 250), the authoritative
+  `out/<id>/` results, the `lock`, and the extracted `gpujail.sh`.
+- Safety (decisions.md §1): `gpu.*` needs a workforest box (a single
+  checkout's box would jail the repo root, `.git` included); the submitted
+  `cwd` must realpath inside a checkout of the caller's forest (no `..`,
+  no absolute, no symlinked `.gpu-jobs`/job dirs); `gpu.status`/`gpu.ls`
+  only show the caller's own jobs; the command reaches the jail as argv,
+  never through a host shell.
 
 ### herdr (`hc`) machines
 
