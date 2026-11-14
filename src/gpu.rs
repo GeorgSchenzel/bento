@@ -217,10 +217,13 @@ impl Job {
     }
 
     fn save(&self, dir: &Path) -> std::io::Result<()> {
-        fs::write(
-            dir.join(format!("{}.json", self.id)),
-            serde_json::to_vec_pretty(self)?,
-        )
+        // atomic (temp + rename in the same dir): the daemon rewrites the
+        // running record (started_at, then the pgid) while clients poll
+        // gpu.status — a torn read there reads as "no such job"
+        let path = dir.join(format!("{}.json", self.id));
+        let tmp = dir.join(format!(".{}.json.tmp{}", self.id, std::process::id()));
+        fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        fs::rename(&tmp, &path)
     }
 
     fn path(&self, state: &Path, stage: &str) -> PathBuf {
