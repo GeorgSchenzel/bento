@@ -29,6 +29,7 @@ use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek};
 use std::os::unix::fs::PermissionsExt as _;
+use std::os::unix::process::CommandExt as _;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Condvar, Mutex};
@@ -204,6 +205,10 @@ struct Job {
     /// an unexpected existing file on the walk. None = copied fine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     copy_error: Option<String>,
+    /// The job's process group id while it runs (M6): recover() kills it
+    /// before marking a found-leftover job 250.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pgid: Option<i32>,
 }
 
 impl Job {
@@ -227,9 +232,14 @@ impl Job {
 // The queue
 // ---------------------------------------------------------------------------
 
+#[derive(Debug)]
 pub struct Queue {
     state: PathBuf,
     inner: Arc<(Mutex<bool>, Condvar)>,
+    /// The exclusive flock on `<state>/lock` (M6), held for as long as this
+    /// queue lives: one daemon per state dir, or GPU jobs would run in
+    /// parallel after a "restart" that did not kill the old one.
+    _lock: File,
 }
 
 impl Queue {
@@ -240,6 +250,8 @@ impl Queue {
 
     /// Testable variant on an explicit state dir. Also used by bridge tests.
     pub fn start_at(state: &Path) -> anyhow::Result<Queue> {
+        // one daemon per state dir (M6), before anything else touches it
+        let lock = lock_state_dir(state)?;
         for stage in ["queued", "running", "done", "out"] {
             fs::create_dir_all(state.join(stage))?;
         }
@@ -260,6 +272,7 @@ impl Queue {
         Ok(Queue {
             state: state.to_path_buf(),
             inner,
+            _lock: lock,
         })
     }
 
@@ -334,6 +347,7 @@ impl Queue {
             exit: None,
             timed_out: None,
             copy_error: None,
+            pgid: None,
         };
         job.save(&self.state.join("queued"))
             .map_err(|e| BridgeError::new("failed", format!("persisting the job: {e}")))?;
@@ -499,8 +513,8 @@ impl Worker {
             eprintln!("bento serve: gpu job {}: preparing out dir: {e}", job.id);
         }
         let jail = self.state.join("gpujail.sh");
-        let status = Command::new("timeout")
-            .arg("-k")
+        let mut cmd = Command::new("timeout");
+        cmd.arg("-k")
             .arg("5")
             .arg(format!("{}s", job.timeout_s))
             .arg(&jail)
@@ -520,7 +534,34 @@ impl Worker {
             .current_dir(&job.forest)
             .stdout(Stdio::from(exclusive_or_sink(&out.join("stdout"))))
             .stderr(Stdio::from(exclusive_or_sink(&out.join("stderr"))))
-            .status();
+            // M6: own process group, so recover() can kill the whole chain
+            .process_group(0);
+        let daemon_pid = std::process::id() as libc::pid_t;
+        unsafe {
+            cmd.pre_exec(move || {
+                // M6: a daemon crash must kill the running job. TERM, not
+                // KILL: timeout forwards it, gpujail's trap cleans up the
+                // scratch home, bwrap has --die-with-parent for its side.
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if libc::getppid() != daemon_pid {
+                    // the daemon died between fork and prctl: never run orphaned
+                    libc::_exit(126);
+                }
+                Ok(())
+            });
+        }
+        let status = match cmd.spawn() {
+            Ok(mut child) => {
+                // the pgid == the child's pid (process_group(0)); record it
+                // so a later daemon's recover() can kill a leftover
+                job.pgid = Some(child.id() as i32);
+                let _ = job.save(&self.state.join("running"));
+                child.wait()
+            }
+            Err(e) => Err(e),
+        };
         let exit = match status {
             Ok(s) => s.code().unwrap_or(253),
             Err(e) => {
@@ -662,6 +703,11 @@ fn recover(state: &Path) {
         };
         let out = out_dir(state, &job.id);
         let _ = fs::create_dir_all(&out);
+        // M6: the leftover process group dies before anything is marked, so
+        // the next daemon never runs two jobs at once
+        if let Some(pgid) = job.pgid {
+            kill_pgid(pgid, &format!("gpu job {}", job.id));
+        }
         let stderr = out.join("stderr");
         if !stderr.exists() {
             let _ = fs::write(&stderr, "bento serve: the queue died while this job ran\n");
@@ -706,6 +752,52 @@ fn recover(state: &Path) {
             let _ = fs::remove_dir_all(entry.path());
         }
     }
+}
+
+/// Take the exclusive flock on `<state>/lock` (M6): a second daemon on the
+/// same state dir must refuse to start — it would run GPU jobs concurrently
+/// with the first. The lock lives as long as the returned File does.
+fn lock_state_dir(state: &Path) -> anyhow::Result<File> {
+    use std::os::unix::io::AsRawFd as _;
+    fs::create_dir_all(state)
+        .map_err(|e| anyhow::anyhow!("creating {}: {e}", state.display()))?;
+    let file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(state.join("lock"))
+        .map_err(|e| anyhow::anyhow!("opening {}: {e}", state.join("lock").display()))?;
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc != 0 {
+        return Err(anyhow::anyhow!(
+            "another bento serve owns the GPU state dir {} (two daemons would run \
+             GPU jobs at once); stop the other daemon or use your own BENTO_GPU_STATE",
+            state.display()
+        ));
+    }
+    Ok(file)
+}
+
+/// Kill a leftover job's process group (M6), carefully: a pgid that is not a
+/// plausible daemon-spawned group (ours, init's, nonsense) is skipped — job
+/// records are daemon-owned, but records on disk are still just data.
+fn kill_pgid(pgid: i32, what: &str) {
+    if pgid <= 1 || pgid == std::process::id() as i32 {
+        eprintln!("bento serve: {what}: refusing to kill process group {pgid}");
+        return;
+    }
+    let rc = unsafe { libc::kill(-(pgid as libc::pid_t), libc::SIGKILL) };
+    if rc != 0 {
+        return; // ESRCH: already gone
+    }
+    // wait for the chain (timeout -> gpujail -> bwrap) to actually die, so
+    // the next job does not share the GPU with the corpse for a moment
+    for _ in 0..40 {
+        if unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == -1 {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    eprintln!("bento serve: {what}: process group {pgid} lingers after SIGKILL");
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,6 +1193,7 @@ mod tests {
             exit: None,
             timed_out: None,
             copy_error: None,
+            pgid: None,
         };
         job("20261113-000001-0001")
             .save(&state.join("queued"))
@@ -1144,6 +1237,7 @@ mod tests {
             exit: None,
             timed_out: None,
             copy_error: None,
+            pgid: None,
         }
         .save(&state.join("running"))
         .unwrap();
@@ -1204,6 +1298,7 @@ mod tests {
             exit: None,
             timed_out: None,
             copy_error: None,
+            pgid: None,
         }
         .save(&state.join("running"))
         .unwrap();
@@ -1259,12 +1354,14 @@ mod tests {
             exit: Some(0),
             timed_out: Some(false),
             copy_error: None,
+            pgid: None,
         }
         .save(&state.join("done"))
         .unwrap();
         let queue = Queue {
             state: state.clone(),
             inner: Arc::new((Mutex::new(false), Condvar::new())),
+            _lock: File::open("/dev/null").unwrap(), // no worker runs in this test
         };
         let rt: tokio::runtime::Handle =
             Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()))
@@ -1467,6 +1564,184 @@ mod tests {
         );
     }
 
+    // --- M6: one daemon per state dir; a crash kills its jobs ---------------
+
+    /// A second queue (daemon) on the same state dir must refuse to start:
+    /// two would run GPU jobs concurrently.
+    #[test]
+    fn a_second_daemon_on_the_same_state_fails() {
+        let state = tempdir("m6-lock-state");
+        let _first = Queue::start_at(&state).unwrap();
+        let err = Queue::start_at(&state).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.to_lowercase().contains("another"),
+            "the error must say another daemon owns the state: {msg}"
+        );
+        // and a different state dir is unaffected
+        let other = tempdir("m6-lock-state-b");
+        drop(Queue::start_at(&other).unwrap());
+    }
+
+    /// recover() kills the leftover process group before marking exit 250.
+    #[test]
+    fn recovery_kills_a_leftover_process_group() {
+        let state = tempdir("m6-recover-state");
+        for stage in ["queued", "running", "done"] {
+            fs::create_dir_all(state.join(stage)).unwrap();
+        }
+        // a leftover process group, as the dead daemon's job would be
+        let pidfile = state.join("leftover.pid");
+        let mut leftover = Command::new("setsid")
+            .arg("sh")
+            .arg("-c")
+            .arg(format!(
+                "echo $$ > '{}'; exec sleep 300",
+                pidfile.display()
+            ))
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let pgid: i32 = loop {
+            if let Ok(text) = fs::read_to_string(&pidfile) {
+                break text.trim().parse().unwrap();
+            }
+            assert!(std::time::Instant::now() < deadline, "setsid never wrote its pid");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
+        let checkout = state.join("no-such-checkout");
+        Job {
+            id: "20261113-150000-00dd".into(),
+            forest: "/tmp/f".into(),
+            checkout: checkout.display().to_string(),
+            tree: "a".into(),
+            cwd: "a".into(),
+            cmd: "sleep 300".into(),
+            timeout_s: 600,
+            dir: "/tmp/f/a/.gpu-jobs/20261113-150000-00dd".into(),
+            queued_at: 1,
+            started_at: Some(2),
+            finished_at: None,
+            exit: None,
+            timed_out: None,
+            copy_error: None,
+            pgid: Some(pgid),
+        }
+        .save(&state.join("running"))
+        .unwrap();
+        recover(&state);
+        // reap the (killed) leftover so the group check is about liveness,
+        // not zombie bookkeeping — init does this for real orphans
+        let _ = leftover.wait();
+        let gone = || unsafe { libc::kill(-(pgid as libc::pid_t), 0) == -1 };
+        assert!(gone(), "recover() must kill the leftover process group");
+        let done = Job::load(&state.join("done").join("20261113-150000-00dd.json")).unwrap();
+        assert_eq!(done.exit, Some(RUNNER_DIED));
+    }
+
+    /// The full M6 story: kill -9 the daemon while a `sleep 60` job runs —
+    /// the job's process group must die with it, and the next daemon must
+    /// recover (250) rather than run two. The child process re-runs this
+    /// test binary as a stand-in daemon (BENTO_GPU_TEST_DAEMON=1).
+    #[test]
+    fn a_daemon_kill_kills_the_running_job() {
+        if let Some(mode) = std::env::var_os("BENTO_GPU_TEST_DAEMON") {
+            // child: a stand-in daemon with one long job, parked until killed.
+            // Paths come from the parent via env — the child shares its
+            // state dir and forest fixture, nothing of its own.
+            let _ = mode;
+            let state = PathBuf::from(std::env::var_os("BENTO_GPU_TEST_STATE").unwrap());
+            let forest = PathBuf::from(std::env::var_os("BENTO_GPU_TEST_FOREST").unwrap());
+            let queue = Queue::start_at(&state).expect("child queue");
+            let rt: tokio::runtime::Handle =
+                Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()))
+                    .handle()
+                    .clone();
+            let caller = Caller {
+                box_name: "bento-forest_wf".into(),
+                path: forest.clone(),
+                forest: Some("wf".into()),
+                machine: "wf".into(),
+                rt,
+            };
+            queue
+                .submit(
+                    &caller,
+                    &json!({"op":"gpu.submit","cwd":"a","cmd":"sleep 60","timeout_s":120}),
+                )
+                .expect("child submit");
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(1));
+            }
+        }
+        // parent: fixture, then spawn the stand-in daemon
+        let (forest, _root) = workforest("m6-kill9");
+        let state = tempdir("m6-kill9-state");
+        let child_log = state.join("daemon-child.log");
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("gpu::tests::a_daemon_kill_kills_the_running_job")
+            .env("BENTO_GPU_TEST_DAEMON", "1")
+            .env("BENTO_GPU_TEST_STATE", &state)
+            .env("BENTO_GPU_TEST_FOREST", &forest)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::from(File::create(&child_log).expect("child log")))
+            .spawn()
+            .unwrap();
+        let mut pgid: Option<i32> = None;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        while pgid.is_none() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the job never recorded a pgid; child log: {}",
+                fs::read_to_string(&child_log).unwrap_or_default()
+            );
+            for entry in fs::read_dir(state.join("running")).into_iter().flatten().flatten() {
+                let Ok(text) = fs::read_to_string(entry.path()) else { continue };
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    pgid = v["pgid"].as_i64().map(|p| p as i32);
+                }
+            }
+            if pgid.is_none() {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+        let pgid = pgid.unwrap();
+        // while the daemon lives, its state dir is locked
+        let err = Queue::start_at(&state).unwrap_err();
+        assert!(format!("{err:#}").to_lowercase().contains("another"), "{err:#}");
+        // kill -9 the daemon; the job's process group must die with it
+        unsafe {
+            libc::kill(child.id() as libc::pid_t, libc::SIGKILL);
+        }
+        let _ = child.wait();
+        let mut gone = false;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while std::time::Instant::now() < deadline {
+            if unsafe { libc::kill(-(pgid as libc::pid_t), 0) } == -1 {
+                gone = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        assert!(gone, "kill -9 of the daemon must kill the job (pgid {pgid})");
+        // the next daemon starts (lock free) and recovers instead of running two
+        let queue = Queue::start_at(&state).unwrap();
+        assert_eq!(fs::read_dir(state.join("running")).unwrap().count(), 0);
+        let done: Vec<_> = fs::read_dir(state.join("done"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert_eq!(done.len(), 1, "exactly the one job, recovered");
+        let job = Job::load(&done[0].path()).unwrap();
+        assert_eq!(job.exit, Some(RUNNER_DIED));
+        assert_eq!(job.pgid, Some(pgid), "the record keeps what it killed");
+        drop(queue);
+    }
+
     #[test]
     fn queued_before_survives_corrupt_names() {
         let state = tempdir("qb");
@@ -1476,6 +1751,7 @@ mod tests {
         let queue = Queue {
             state: state.clone(),
             inner: Arc::new((Mutex::new(false), Condvar::new())),
+            _lock: File::open("/dev/null").unwrap(), // no worker runs in this test
         };
         // a corrupt non-UTF8 name in queued/ (torn state dir) must not panic
         use std::os::unix::ffi::OsStringExt as _;
@@ -1500,6 +1776,7 @@ mod tests {
             exit: None,
             timed_out: None,
             copy_error: None,
+            pgid: None,
         };
         job("20261113-000100-0000")
             .save(&state.join("queued"))
