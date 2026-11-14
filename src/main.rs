@@ -2,6 +2,7 @@ mod agent;
 mod bridge;
 mod builder;
 mod forest;
+mod gpu;
 mod sandbox;
 mod store;
 mod util;

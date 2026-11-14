@@ -117,10 +117,41 @@ auto-starts it.
   token alone; a connection must start with `hello`.
 - Ops (protocol, request and reply shapes: `src/bridge.rs`): `hello`,
   `forest.ls`, `forest.add`, `forest.name`, `forest.new` (create only; a
-  `brief` handoff is not implemented yet), `gpu.*` (with G1). Forest work
-  runs the host's `forest` binary — `$BENTO_FOREST_BIN`, else `forest` on
-  `PATH` — as argv, never through a shell, always `--no-fetch` for
-  anything that could fetch.
+  `brief` handoff is not implemented yet), `gpu.submit`, `gpu.status`,
+  `gpu.ls`. Forest work runs the host's `forest` binary —
+  `$BENTO_FOREST_BIN`, else `forest` on PATH — as argv, never through a
+  shell, always `--no-fetch` for anything that could fetch.
+
+### GPU jobs (`gpu.*`)
+
+One jailed job at a time on the host, FIFO across all forests: an agent in
+a box runs `forest gpu run -- <cmd>` (the bridge ops `gpu.submit` /
+`gpu.status` / `gpu.ls`), the queue in `src/gpu.rs` runs it as
+`timeout -k 5 <t> gpujail.sh <forest> -- bash -lc <cmd>`, and the results
+land in `<forest>/<checkout>/.gpu-jobs/<id>/` (`cmd`, `stdout`, `stderr`,
+`exit` written last, `timed-out`, `files/` — the job's `$GPU_JOB_FILES`),
+readable from the box at `/workspace/<checkout>/.gpu-jobs/<id>`.
+
+- The jail (bubblewrap, `assets/gpujail.sh`, embedded into the binary and
+  written to the state dir on `bento serve`): no network, only the forest's
+  files writable, `~/.ssh`/other forests/`~/projects/repos`/credentials
+  invisible, GPU (`/dev/dri` + NVIDIA nodes) and a display available.
+  Properties are re-verified by `assets/test-gpujail.sh` (headless and
+  real-display mode).
+- **Display**: by default each job gets its own **headless compositor**
+  (sway, `WLR_BACKENDS=headless`, on the real GPU) inside the jail — the
+  user's real wayland/X11 sockets are not bound, so jobs can neither
+  screenshot nor inject into the real desktop. Consequences: no X11 in jobs,
+  and the headless seat has no input devices (tools with mesa-demos' eglut
+  bug, e.g. `eglgears_wayland`, crash on it). `BENTO_GPU_REAL_DISPLAY=1` on
+  the daemon restores R5's real-display binding for such cases.
+- State: `$BENTO_GPU_STATE` (default `~/.local/share/bento/gpu/`) holds
+  `{queued,running,done}/<id>.json` (claim by rename; a job found `running`
+  at daemon startup is marked exit 250) and the extracted `gpujail.sh`.
+- Safety (decisions.md §1): the submitted `cwd` must realpath inside a
+  checkout of the caller's forest (no `..`, no absolute, no symlinked
+  `.gpu-jobs`/job dirs); `gpu.status`/`gpu.ls` only show the caller's own
+  jobs; the command reaches the jail as argv, never through a host shell.
 
 ### Agents
 

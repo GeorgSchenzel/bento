@@ -27,3 +27,6 @@ result
 
 # spike scratch (gitignored test client etc.)
 .spike/
+
+# gpu jail test scratch (assets/test-gpujail.sh)
+assets/scratch/

@@ -267,7 +267,8 @@ fn dir_basename(dir: &Path) -> String {
 
 /// microsandbox names allow only [A-Za-z0-9._-] and must start alphanumeric
 /// (always satisfied by the "bento_" prefix); tree dirs use the same set.
-fn slug(input: &str) -> String {
+/// pub: gpu.rs maps a checkout dir to its `/workspace/<tree>` name the same way.
+pub fn slug(input: &str) -> String {
     let s: String = input
         .chars()
         .map(|c| {
