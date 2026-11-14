@@ -816,7 +816,10 @@ fn caller_root(caller: &Caller) -> PathBuf {
 /// that will hold the results. `workforest` switches the rules:
 ///
 /// - workforest: the first component names the checkout (`<root>/<tree>/…`);
-///   it must be a dir with a `.git` (forest.rs's own definition of a tree).
+///   it must be a dir with a `.git` (forest.rs's own definition of a tree),
+///   and its realpath must be a DIRECT child of the root's realpath — a
+///   symlinked checkout name would otherwise run the job (and land its
+///   results) outside the caller's forest.
 /// - single checkout: the root IS the checkout; the cwd is relative to it.
 ///
 /// Either way the realpath of the joined dir must stay inside the realpath of
@@ -874,6 +877,24 @@ fn validate_cwd(
             format!("checkout '{}' not found", checkout.display()),
         )
     })?;
+    // The checkout must be a DIRECT child of the forest root after
+    // realpath: a symlinked checkout name would resolve to a dir outside
+    // the caller's forest, and the job (and its results) must not go there.
+    let real_root = fs::canonicalize(root).map_err(|_| {
+        BridgeError::new(
+            "bad_request",
+            format!("forest root '{}' not found", root.display()),
+        )
+    })?;
+    if workforest && real_checkout.parent() != Some(real_root.as_path()) {
+        return Err(BridgeError::new(
+            "bad_request",
+            format!(
+                "'{}' is not a checkout directly inside this forest (symlinked name?)",
+                real_checkout.display()
+            ),
+        ));
+    }
     if !real.starts_with(&real_checkout) {
         return Err(BridgeError::new(
             "bad_request",
@@ -1147,6 +1168,30 @@ mod tests {
         assert!(validate_cwd(&solo, "..", false).is_err());
         assert!(validate_cwd(&solo, "link", false).is_err()); // symlink out
         let _ = root; // scratch root lives under this tempdir
+    }
+
+    /// A symlinked CHECKOUT NAME (forests/link -> a dir with a .git outside
+    /// the forest) passes the `.git` and the inside-checkout checks and
+    /// would run the job outside the caller's forest: the canonical
+    /// checkout must be a direct child of the canonical root.
+    #[test]
+    fn a_symlinked_checkout_name_is_refused() {
+        let (forest, root) = workforest("cwd-symlink");
+        let outside = root.join("outside");
+        fs::write(outside.join(".git"), "gitdir: fake").unwrap();
+        fs::write(outside.join("f"), "x").unwrap();
+        std::os::unix::fs::symlink(&outside, forest.join("stolen")).unwrap();
+
+        let err = validate_cwd(&forest, "stolen", true).unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(
+            err.message.contains("directly inside"),
+            "the refusal must say why: {}",
+            err.message
+        );
+        // the honest checkouts of the same forest still pass
+        assert!(validate_cwd(&forest, "a", true).is_ok());
+        assert!(validate_cwd(&forest, "b", true).is_ok());
     }
 
     #[test]
