@@ -87,6 +87,8 @@ forest gpu run --cwd game --timeout 60 -- './run.sh & sleep 10; grim "$GPU_JOB_F
 
 - One argument after `--` is a shell snippet (as above); several arguments are
   one command, no snippet (`-- cargo test`).
+- The display is a headless Wayland compositor on the GPU; no X11 (`glxinfo`
+  fails) — use `eglinfo -B`, Wayland/EGL/Vulkan apps (`vkcube --wsi wayland`).
 - The job's cwd is where you are, or `--cwd <repo>/sub`; it must be inside
   `/workspace/<checkout>`.
 - `forest gpu run` waits, prints the job's stdout/stderr and exits with its
@@ -96,6 +98,9 @@ forest gpu run --cwd game --timeout 60 -- './run.sh & sleep 10; grim "$GPU_JOB_F
   (written last: it existing means the job is done), and `files/` — the job's
   `$GPU_JOB_FILES`, where it writes screenshots and other artifacts;
   `$GPU_JOB_DIR` is the whole result dir.
+- Screenshot while the app runs: `app & sleep 3; grim "$GPU_JOB_FILES/shot.png"; kill %1`.
+  A foreground app blocks the snippet, and a shot after it exits is all black
+  (exit 0, silently).
 - One GPU job at a time on the whole machine, across all forests: keep jobs
   short. Timeout defaults to 600 s, max 3600 s; a timed-out job is killed and
   marked.
