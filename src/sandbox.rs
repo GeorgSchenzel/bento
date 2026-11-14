@@ -16,6 +16,7 @@ use crate::agent;
 use crate::bridge;
 use crate::builder;
 use crate::forest::{self, Forest, WORKDIR};
+use crate::herdr;
 use crate::store;
 use crate::util;
 
@@ -89,7 +90,9 @@ pub fn state_dir(forest: &Forest) -> Result<PathBuf> {
     box_state_dir(&forest.name)
 }
 
-fn box_state_dir(name: &str) -> Result<PathBuf> {
+/// A box's state dir by box name. Pub for herdr's unregister, which looks a
+/// box up by name alone when the forest itself is already gone.
+pub fn box_state_dir(name: &str) -> Result<PathBuf> {
     Ok(util::data_dir()?.join("boxes").join(name))
 }
 
@@ -371,6 +374,14 @@ pub async fn create(forest: &Forest) -> Result<Sandbox> {
         .with_context(|| format!("creating box '{}'", forest.name))?;
     util::record_dns(&state.join("host-dns"));
     services(&sb).await?;
+    // Agents started by hc never pass through `bento opencode`, so the
+    // host's opencode credentials must be in the box from creation. The
+    // import is idempotent (a fingerprint marker); `bento opencode` still
+    // re-runs it when the host's keys change.
+    if let Err(e) = agent::import_opencode_credentials(&sb, &home, &state).await {
+        eprintln!("bento: importing opencode credentials: {e:#}");
+    }
+    herdr::register(forest);
     Ok(sb)
 }
 
@@ -607,6 +618,7 @@ pub async fn prune() -> Result<()> {
     let mut total = Some(0);
     for (name, path) in &gone {
         println!("box '{name}': {path} is gone");
+        herdr::unregister(Path::new(path), name);
         let freed = remove(name).await?;
         total = total.zip(freed).map(|(t, f)| t + f);
     }

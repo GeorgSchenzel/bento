@@ -153,6 +153,25 @@ readable from the box at `/workspace/<checkout>/.gpu-jobs/<id>`.
   `.gpu-jobs`/job dirs); `gpu.status`/`gpu.ls` only show the caller's own
   jobs; the command reaches the jail as argv, never through a host shell.
 
+### herdr (`hc`) machines
+
+With `BENTO_HC` set (the host `hc` binary's path), bento registers every
+workforest box as a machine on the host's hc core when it creates it
+(`bento start`), so `hc ls` on the host lists and drives the agents of
+every forest: `hc run --on <forest-name> --cwd /workspace opencode "<task>"`.
+The machine name is the forest dir's name (`spike-x` → machine `spike-x`,
+kept in the box's `bridge.json`), and its via line is `<msb> exec --stream
+<box> -- sh -c` — byte-exact stdio without a PTY, and never `bento exec`,
+which would start or even recreate stopped or removed boxes from hc's
+reconnect loop. Registration replaces any entry of the same name and only
+warns on failure; `bento rm` and `bento prune` remove the machine entry.
+Boxes of single checkouts are not registered.
+
+Without `BENTO_HC` nothing touches any hc core (no PATH fallback). Test
+with an isolated core, never the real one: a separate `hc` binary plus
+`XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_RUNTIME_DIR` of your own, `BENTO_HC`
+pointing at that binary, `hc server start`, then `bento start`.
+
 ### Agents
 
 The box sees the host's agent config read-only: `~/.claude/{settings.json,

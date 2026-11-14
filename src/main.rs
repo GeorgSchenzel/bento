@@ -3,6 +3,7 @@ mod bridge;
 mod builder;
 mod forest;
 mod gpu;
+mod herdr;
 mod sandbox;
 mod store;
 mod util;
@@ -138,7 +139,10 @@ async fn run(command: Command) -> Result<u8> {
             Ok(0)
         }
         Command::Rm => {
-            sandbox::rm(&forest::discover()?).await?;
+            let forest = forest::discover()?;
+            // the machine entry goes before the state dir that names it
+            herdr::unregister(&forest.dir, &forest.name);
+            sandbox::rm(&forest).await?;
             Ok(0)
         }
         Command::Ls => {
