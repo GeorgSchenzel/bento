@@ -112,6 +112,11 @@ J bash -c "[ \"\${SECRETCANARY:-}\" = \"$CANARY\" ]" 2>/dev/null \
   && bad "wrapper env (canary/credentials) leaks into jail" || ok "wrapper env (canary/credentials) does not leak into jail"
 J bash -c '[ -n "${HOME:-}" ] && [ -n "${PATH:-}" ] && [ "${XDG_RUNTIME_DIR:-}" = /run/user/'"$(id -u)"' ]' \
   && ok "explicit jail env is set (HOME, PATH, XDG_RUNTIME_DIR)" || bad "explicit jail env is set"
+# M1: even when the wrapper itself runs on a terminal (script gives it a pty),
+# the jailed job must have NO controlling tty — /dev/tty must not openable
+script -qefc "$GJ $FOREST -- bash -c '(exec 3<>/dev/tty) 2>/dev/null && echo HAS-CTTY || echo NO-CTTY'" /dev/null </dev/null 2>&1 | grep -q NO-CTTY \
+  && ok "jail has no controlling tty (bwrap --new-session)" \
+  || bad "jail has no controlling tty (bwrap --new-session)"
 
 # ---- 5. no network ----------------------------------------------------------
 J bash -c 'timeout 4 bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null' \

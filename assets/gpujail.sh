@@ -19,6 +19,9 @@
 #     sockets, dbus), nix daemon socket, opencode/claude credentials: invisible
 #   - no host environment is passed in (clearenv) — credentials that live in env
 #     vars (ANTHROPIC_API_KEY, …) do not leak into the job
+#   - no controlling tty (--new-session): a job can never TIOCSTI keystrokes
+#     into the wrapper's/daemon's terminal; the queue also runs the wrapper
+#     with stdin from /dev/null, so a job cannot read the daemon's stdin
 #   - GPU (NVIDIA + Mesa /dev/dri) and display work; see Display
 #
 # Tool: bubblewrap. Chose it over nsjail/firejail/systemd-run because it is the
@@ -215,6 +218,7 @@ env_job=()
   --unshare-net \
   --unshare-pid \
   --unshare-ipc \
+  --new-session \
   --die-with-parent \
   --chdir "$chdir" \
   --clearenv \

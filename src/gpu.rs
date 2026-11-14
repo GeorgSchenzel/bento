@@ -509,6 +509,9 @@ impl Worker {
             .arg("bash")
             .arg("-lc")
             .arg(&job.cmd)
+            // M1: the job never reads the daemon's stdin and never shares its
+            // session — no tty to TIOCSTI into (gpujail.sh adds --new-session)
+            .stdin(Stdio::null())
             .env("BENTO_GPU_CWD", &job.cwd)
             .env("GPU_JOB_DIR", &job.dir)
             .env("GPU_JOB_FILES", Path::new(&job.dir).join("files"))
@@ -1401,6 +1404,67 @@ mod tests {
             .join("20261113-140000-0005")
             .join("timed-out")
             .exists());
+    }
+
+    /// M1: a job gets no tty and no controlling tty, even when the daemon
+    /// itself runs on one. Run this test under a pty to mean anything:
+    ///   script -qefc 'cargo test jobs_get_no_tty' /dev/null
+    #[test]
+    fn jobs_get_no_tty_and_no_controlling_tty() {
+        let (forest, _root) = workforest("m1-tty");
+        let state = tempdir("m1-tty-state");
+        let queue = Queue::start_at(&state).unwrap();
+        let rt: tokio::runtime::Handle =
+            Box::leak(Box::new(tokio::runtime::Runtime::new().unwrap()))
+                .handle()
+                .clone();
+        let caller = Caller {
+            box_name: "bento-forest_wf".into(),
+            path: forest.clone(),
+            forest: Some("wf".into()),
+            machine: "wf".into(),
+            rt,
+        };
+        let cmd =
+            r#"head -c 4; tty; (exec 3<>/dev/tty) 2>/dev/null && echo HAS-CTTY || echo NO-CTTY"#;
+        let reply = queue
+            .submit(
+                &caller,
+                &json!({"op":"gpu.submit","cwd":"a","cmd":cmd,"timeout_s":60}),
+            )
+            .unwrap();
+        let id = reply["id"].as_str().unwrap().to_string();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+        let status = loop {
+            let st = queue
+                .status(&caller, &json!({"op":"gpu.status","id":id}))
+                .unwrap();
+            if st["state"] == "done" {
+                break st;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job never finished: {st}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        };
+        assert_eq!(status["exit"], json!(0), "{status}");
+        let stdout = fs::read_to_string(
+            state.join("out").join(&id).join("stdout"),
+        )
+        .unwrap_or_default();
+        assert!(
+            !stdout.contains("SECR"),
+            "the job must not read the daemon's stdin (Stdio::null): {stdout:?}"
+        );
+        assert!(
+            stdout.contains("not a tty"),
+            "stdin must be null, job saw: {stdout:?}"
+        );
+        assert!(
+            stdout.contains("NO-CTTY"),
+            "the job must have no controlling tty (bwrap --new-session): {stdout:?}"
+        );
     }
 
     #[test]
