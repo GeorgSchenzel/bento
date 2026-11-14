@@ -311,13 +311,37 @@ fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
+/// What bento's git invocations never run, wherever the checkout's config
+/// points — the same list forest's runners carry (forest/src/git.rs, B3):
+/// the checkouts this runs in are box-writable, so their config (or the
+/// `.git` pointer choosing it) is never trusted. fsmonitor and hooks are
+/// the known code vectors; sshCommand and diff.external name programs,
+/// protocol.file.allow=user keeps a config-chosen file:// fetch off host
+/// paths, and no pager is ever spawned. (Filters cannot be closed by a
+/// fixed flag list — the commands run here do not trigger them.)
+const NO_HOST_CODE: [&str; 6] = [
+    "core.fsmonitor=false",
+    "core.hooksPath=/dev/null",
+    "protocol.file.allow=user",
+    "core.sshCommand=ssh",
+    "diff.external=",
+    "core.pager=cat",
+];
+
+/// The git Command for `dir`, hardened like forest's runners; separate so
+/// tests can pin the flags.
+fn git_command(dir: &Path, args: &[&str]) -> Command {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir);
+    for cfg in NO_HOST_CODE {
+        cmd.arg("-c").arg(cfg);
+    }
+    cmd.args(args);
+    cmd
+}
+
 pub fn git(dir: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .ok()?;
+    let out = git_command(dir, args).output().ok()?;
     if !out.status.success() {
         return None;
     }
@@ -374,5 +398,116 @@ mod tests {
         assert!(at(&root.join("repos").join("bento")).is_err());
         assert!(at(&root).is_err());
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // --- B3: git in box-writable checkouts runs no config-named code -------
+
+    /// A scratch repo, hermetic against the host's git config.
+    fn repo(name: &str) -> (PathBuf, PathBuf) {
+        let base =
+            std::env::temp_dir().join(format!("bento-forest-git-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        fs::create_dir_all(&base).unwrap();
+        fs::write(
+            base.join("gitconfig"),
+            "[user]\nname = T\nemail = t@example.com\n[init]\ndefaultBranch = main\n",
+        )
+        .unwrap();
+        let dir = base.join("repo");
+        fs::create_dir_all(&dir).unwrap();
+        for args in [
+            vec!["init", "-q"],
+            vec!["commit", "-q", "--allow-empty", "-m", "first"],
+        ] {
+            let out = Command::new("git")
+                .arg("-C")
+                .arg(&dir)
+                .args(&args)
+                .env("GIT_CONFIG_GLOBAL", base.join("gitconfig"))
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .output()
+                .expect("running git");
+            assert!(
+                out.status.success(),
+                "git {args:?}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        (base, dir)
+    }
+
+    /// A repo whose `core.fsmonitor` touches a canary: bento's git must not
+    /// run it — the checkouts it runs in are box-writable, so their config
+    /// must not choose what runs on the host.
+    #[test]
+    fn git_never_runs_the_repo_fsmonitor() {
+        let (base, dir) = repo("fsmonitor");
+        let mark = base.join("fsmonitor-ran");
+        let hook = base.join("fsmonitor.sh");
+        fs::write(&hook, format!("#!/bin/sh\ntouch {}\n", mark.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let mut cmd = git_command(&dir, &["config", "core.fsmonitor", &hook.display().to_string()]);
+        cmd.env("GIT_CONFIG_GLOBAL", base.join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1");
+        let out = cmd.output().unwrap();
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+
+        // the canary works: plain git, without bento's hardening, runs it
+        let plain = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["status", "--porcelain"])
+            .env("GIT_CONFIG_GLOBAL", base.join("gitconfig"))
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(plain.status.success());
+        assert!(mark.exists(), "plain git must run the fsmonitor");
+
+        // bento's runner does not, for the very command that consults it
+        let _ = fs::remove_file(&mark);
+        fs::write(dir.join("untracked"), "x").unwrap();
+        assert_eq!(
+            git(&dir, &["status", "--porcelain"]).as_deref(),
+            Some("?? untracked"),
+            "status itself must still work"
+        );
+        assert_eq!(git(&dir, &["branch", "--show-current"]).as_deref(), Some("main"));
+        assert!(!mark.exists(), "bento git ran the repo's core.fsmonitor");
+        fs::remove_dir_all(&base).unwrap();
+    }
+
+    /// The hardening flags are on the one Command every bento git call
+    /// builds; pinned so a rename cannot slip one past review.
+    #[test]
+    fn git_carries_the_hardening_flags() {
+        let (base, dir) = repo("flags");
+        let cmd = git_command(&dir, &["branch", "--show-current"]);
+        let argv: Vec<String> = cmd
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        let expected: Vec<String> = std::iter::once("-C".to_string())
+            .chain([dir.display().to_string()])
+            .chain(
+                NO_HOST_CODE
+                    .iter()
+                    .flat_map(|c| ["-c".to_string(), (*c).to_string()]),
+            )
+            .chain([
+                "branch".to_string(),
+                "--show-current".to_string(),
+            ])
+            .collect();
+        assert_eq!(argv, expected);
+        fs::remove_dir_all(&base).unwrap();
     }
 }
