@@ -57,11 +57,21 @@ pub struct BoxInfo {
 /// an error, not a silent fallback — a typo'd port would point boxes at
 /// nothing.
 pub fn port_from_env() -> Result<u16> {
+    match env_port()? {
+        Some(p) => Ok(p),
+        None => Ok(DEFAULT_PORT),
+    }
+}
+
+/// `BENTO_BRIDGE_PORT` as `Some(port)`, `None` when unset. Callers decide
+/// whether an unset var means the default or "keep what is stored".
+fn env_port() -> Result<Option<u16>> {
     match std::env::var("BENTO_BRIDGE_PORT") {
         Ok(v) => v
             .parse()
+            .map(Some)
             .with_context(|| format!("bad BENTO_BRIDGE_PORT '{v}'")),
-        Err(std::env::VarError::NotPresent) => Ok(DEFAULT_PORT),
+        Err(std::env::VarError::NotPresent) => Ok(None),
         Err(e) => Err(e).context("reading BENTO_BRIDGE_PORT"),
     }
 }
@@ -69,10 +79,38 @@ pub fn port_from_env() -> Result<u16> {
 /// The box's bridge.json, read or created. The token is fixed once per box
 /// and reused, so it survives box recreation (`bento start`) without the
 /// env plumbing changing under a running setup.
+///
+/// The port follows the daemon when the caller knows it: an explicit
+/// `BENTO_BRIDGE_PORT` rewrites a stored port that differs, so a moved
+/// daemon reaches its boxes after their next `bento start`. Without the
+/// env var the stored port stays as it is; when it is not the default, a
+/// warning says what the box expects — exactly the case where starting
+/// `bento serve` plain makes every box look offline.
 pub fn ensure_box_info(state: &Path, box_name: &str, dir: &Path) -> Result<BoxInfo> {
     let path = state.join("bridge.json");
+    let port = env_port()?;
     if let Ok(text) = fs::read_to_string(&path) {
-        if let Ok(info) = serde_json::from_str::<BoxInfo>(&text) {
+        if let Ok(mut info) = serde_json::from_str::<BoxInfo>(&text) {
+            match port {
+                Some(p) if p != info.port => {
+                    eprintln!(
+                        "bento: box '{box_name}' bridge port {} -> {p} (BENTO_BRIDGE_PORT); \
+                         `bento start` applies it to a running box",
+                        info.port
+                    );
+                    info.port = p;
+                    write_secret(&path, &serde_json::to_vec_pretty(&info)?)?;
+                }
+                Some(_) => {}
+                None if info.port != DEFAULT_PORT => {
+                    eprintln!(
+                        "bento: box '{box_name}' expects the bridge on port {} (not the default {}); \
+                         start `bento serve --port {}` or export BENTO_BRIDGE_PORT={}",
+                        info.port, DEFAULT_PORT, info.port, info.port
+                    );
+                }
+                None => {}
+            }
             return Ok(info);
         }
         // unreadable or corrupt: fall through and regenerate (a fresh token
@@ -82,7 +120,7 @@ pub fn ensure_box_info(state: &Path, box_name: &str, dir: &Path) -> Result<BoxIn
         token: random_token().context("generating the bridge token")?,
         box_name: box_name.to_string(),
         path: dir.display().to_string(),
-        port: port_from_env()?,
+        port: port.unwrap_or(DEFAULT_PORT),
         machine: unique_machine(state, &dir_name(dir))?,
     };
     write_secret(&path, &serde_json::to_vec_pretty(&info)?)?;
@@ -1047,6 +1085,15 @@ fn write_reply(writer: &mut TcpStream, reply: &Value) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    /// Tests that read or write BENTO_BRIDGE_PORT hold this: cargo runs
+    /// the tests of one binary in parallel threads with one environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Poisoned only by a panicked holder; the next test can still run.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
     fn tempdir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("bento-bridge-test-{}-{name}", std::process::id()));
@@ -1082,6 +1129,8 @@ mod tests {
     /// breaks terminal-id shapes.
     #[test]
     fn machine_names_are_unique_across_boxes() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
         let root = tempdir("uniq");
         let (boxes, dirs) = (root.join("boxes"), root.join("dirs"));
         fs::create_dir_all(&boxes).unwrap();
@@ -1123,6 +1172,39 @@ mod tests {
         fs::write(boxes.join("broken/bridge.json"), "{").unwrap();
         let e = ensure_box_info(&box_state("b8"), "bento-b8", &dir_of("fresh")).unwrap();
         assert_eq!(e.machine, "fresh");
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// M4: an explicit BENTO_BRIDGE_PORT updates an existing bridge.json
+    /// (the daemon moved); without it the stored port stays; a bad value is
+    /// an error even when the file is there, and never changes it.
+    #[test]
+    fn an_explicit_port_follows_the_daemon() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let root = tempdir("port-follow");
+        let dir = root.join("thing");
+        fs::create_dir_all(&dir).unwrap();
+        let state = root.join("boxes/x");
+        fs::create_dir_all(&state).unwrap();
+        let first = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(first.port, DEFAULT_PORT);
+
+        std::env::set_var("BENTO_BRIDGE_PORT", "17800");
+        let second = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(second.port, 17800);
+        assert_eq!(second.token, first.token, "only the port is rewritten");
+
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let third = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(third.port, 17800, "without the env, the stored port stays");
+
+        std::env::set_var("BENTO_BRIDGE_PORT", "not-a-port");
+        let err = ensure_box_info(&state, "bento-x", &dir).unwrap_err();
+        assert!(err.to_string().contains("BENTO_BRIDGE_PORT"), "{err:#}");
+        std::env::remove_var("BENTO_BRIDGE_PORT");
+        let fourth = ensure_box_info(&state, "bento-x", &dir).unwrap();
+        assert_eq!(fourth.port, 17800, "a bad value leaves the file alone");
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1178,6 +1260,8 @@ mod tests {
 
     #[test]
     fn box_info_is_created_once_and_secret() {
+        let _env = lock_env();
+        std::env::remove_var("BENTO_BRIDGE_PORT");
         use std::os::unix::fs::PermissionsExt as _;
         let root = tempdir("state");
         // under a boxes/ dir, like the real layout: the uniqueness scan
