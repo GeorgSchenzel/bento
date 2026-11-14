@@ -367,19 +367,28 @@ fn handle_request(
 
 /// The dispatch table: one arm per op (decisions §1). The GPU arms hand the
 /// whole request to the queue (src/gpu.rs), which owns the safety rules.
+/// gpu.* needs a workforest box (M5): a single checkout's box would jail the
+/// repo root itself, `.git` included.
 fn dispatch(daemon: &Daemon, caller: &Caller, op: &str, req: &Value) -> Result<Value, BridgeError> {
+    if let Some(gpu_op) = op.strip_prefix("gpu.") {
+        if matches!(gpu_op, "submit" | "status" | "ls") {
+            require_workforest(caller)?;
+        }
+        return match gpu_op {
+            "submit" => daemon.gpu.submit(caller, req),
+            "status" => daemon.gpu.status(caller, req),
+            "ls" => daemon.gpu.ls(caller),
+            _ => Err(BridgeError::new(
+                "unknown_op",
+                format!("unknown op '{op}' (gpu.submit, gpu.status, gpu.ls)"),
+            )),
+        };
+    }
     match op {
         "forest.ls" => forest_ls(caller),
         "forest.add" => forest_add(caller, req),
         "forest.name" => forest_name(caller, req),
         "forest.new" => forest_new(caller, req),
-        "gpu.submit" => daemon.gpu.submit(caller, req),
-        "gpu.status" => daemon.gpu.status(caller, req),
-        "gpu.ls" => daemon.gpu.ls(caller),
-        op if op.starts_with("gpu.") => Err(BridgeError::new(
-            "unknown_op",
-            format!("unknown op '{op}' (gpu.submit, gpu.status, gpu.ls)"),
-        )),
         _ => Err(BridgeError::new("unknown_op", format!("unknown op '{op}'"))),
     }
 }
@@ -1211,6 +1220,37 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.code, "bad_request");
         assert!(err.message.contains("brief"), "{}", err.message);
+    }
+
+    #[test]
+    fn gpu_ops_need_a_workforest_box() {
+        let dir = tempdir("gpu-forest");
+        // a single checkout box: .git file + a real subdir — not a
+        // forests/<name> layout. Its root IS the repo, so a jail for it
+        // would bind the whole repo including .git: gpu.* must refuse.
+        let checkout = dir.join("bento");
+        fs::create_dir_all(checkout.join("sub")).unwrap();
+        fs::write(checkout.join(".git"), "gitdir: fake").unwrap();
+        let daemon = test_daemon(&dir);
+        let caller = caller_at(&checkout);
+        assert_eq!(caller.forest, None, "fixture must be a non-workforest box");
+        // cwd "sub" is a real dir inside the checkout, so this submit passes
+        // path validation — the refusal must come from the workforest rule
+        let err = dispatch(
+            &daemon,
+            &caller,
+            "gpu.submit",
+            &json!({"op":"gpu.submit","cwd":"sub","cmd":"true"}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "not_a_forest", "{}", err.message);
+        for (op, req) in [
+            ("gpu.status", json!({"op":"gpu.status","id":"20261113-000000-0000"})),
+            ("gpu.ls", json!({"op":"gpu.ls"})),
+        ] {
+            let err = dispatch(&daemon, &caller, op, &req).unwrap_err();
+            assert_eq!(err.code, "not_a_forest", "{op}: {}", err.message);
+        }
     }
 
     #[test]

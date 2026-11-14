@@ -19,6 +19,9 @@
 #     sockets, dbus), nix daemon socket, opencode/claude credentials: invisible
 #   - no host environment is passed in (clearenv) — credentials that live in env
 #     vars (ANTHROPIC_API_KEY, …) do not leak into the job
+#   - no controlling tty (--new-session): a job can never TIOCSTI keystrokes
+#     into the wrapper's/daemon's terminal; the queue also runs the wrapper
+#     with stdin from /dev/null, so a job cannot read the daemon's stdin
 #   - GPU (NVIDIA + Mesa /dev/dri) and display work; see Display
 #
 # Tool: bubblewrap. Chose it over nsjail/firejail/systemd-run because it is the
@@ -58,6 +61,9 @@
 #   $scratch          -> $HOME       rw    ephemeral home (fontconfig/mesa/nvidia shader caches);
 #                                           host mktemp -d, deleted after the job (see cleanup)
 #   $forest           -> $forest     rw    THE point: the forest's files, same path as on host
+#   <tree>/.git       -> itself     new   tmpfs over each checkout's real .git dir (a plain
+#                                            clone's gitdir: no reads, no planted commits/hooks);
+#                                            worktree .git FILEs are pointers, left alone
 #   /run              -> /run        new   tmpfs hides /run/user/<uid> (secrets, agent sockets);
 #                                           headless mode also puts the job's compositor runtime
 #                                           dir on it (writable, gone with the jail)
@@ -71,6 +77,11 @@
 #                                           XWayland without an Xauthority file)
 #   /nix/var          -> /nix/var    new   tmpfs hides the nix daemon socket — else a jailed
 #                                           `nix build` could write the store via the daemon
+#   /var, /srv,       -> themselves  new   tmpfs over each (M7) that exists on the host: jobs
+#   /mnt, /media                            see empty writable dirs, never host /var/lib,
+#                                           mounts or media (bwrap needs an existing
+#                                           mountpoint; a host path that doesn't exist is
+#                                           already invisible through the ro /)
 #   /proc             -> /proc       new   fresh procfs for the unshared pid ns
 # Not bound: /run/user/<uid>/bus (dbus), pipewire/pulse (audio) — add per need later.
 #
@@ -182,6 +193,32 @@ else
   set -- bash -c "$HEADLESS_WRAPPER" gpujob "$@"
 fi
 
+# Overlay every checkout's real .git DIRECTORY with a tmpfs (M5). Worktrees
+# have a .git FILE (a pointer to a hidden gitdir) — harmless, left alone. A
+# checkout that is a plain clone has the real gitdir inside the forest, and
+# the rw bind below would hand it to the job: it could read the repo's
+# objects, plant commits, or write hooks. The tmpfs keeps the path (git in
+# the jail sees an empty .git = not a repository) while the real contents
+# stay on the host, untouched. Symlinked .git entries are skipped, not
+# followed (bwrap resolves mount targets through symlinks).
+git_overlays=()
+for d in "$forest"/*/; do
+  [ -d "$d.git" ] && [ ! -L "$d.git" ] || continue
+  git_overlays+=(--tmpfs "${d%/}/.git")
+done
+
+# System dirs with host content that a job has no business seeing become
+# private writable tmpfs (M7): /var (lib, log, db…), /srv, /mnt, /media —
+# whichever of them exist on the host (bwrap needs an existing mountpoint,
+# and a path the host does not have is invisible through the ro / anyway).
+# Nothing in the graphics stack needs host /var: mesa/vulkan state lives in
+# $XDG_CACHE_HOME (the ephemeral home) and /run/opengl-driver; fontconfig
+# regenerates its cache per job.
+sys_tmpfs=()
+for d in /var /srv /mnt /media; do
+  [ -d "$d" ] && sys_tmpfs+=(--tmpfs "$d")
+done
+
 env_job=()
 [ -n "${GPU_JOB_DIR:-}" ] && env_job+=(--setenv GPU_JOB_DIR "$GPU_JOB_DIR")
 [ -n "${GPU_JOB_FILES:-}" ] && env_job+=(--setenv GPU_JOB_FILES "$GPU_JOB_FILES")
@@ -210,11 +247,14 @@ env_job=()
   "${display_binds[@]}" \
   --tmpfs /tmp \
   --bind "$forest" "$forest" \
+  "${git_overlays[@]}" \
   --tmpfs /nix/var \
+  "${sys_tmpfs[@]}" \
   --proc /proc \
   --unshare-net \
   --unshare-pid \
   --unshare-ipc \
+  --new-session \
   --die-with-parent \
   --chdir "$chdir" \
   --clearenv \

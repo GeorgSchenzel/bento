@@ -66,7 +66,21 @@ J bash -c "echo x > \$HOME/hometest" && [ ! -e "$HOME/hometest" ] \
 J bash -c "echo x > /dev/shm/s" && ok "/dev/shm is writable" || bad "/dev/shm is writable"
 J bash -c "echo x > /etc/t" 2>/dev/null && bad "/etc is not writable" || ok "/etc is not writable"
 J bash -c "echo x > /nix/store/t" 2>/dev/null && bad "/nix/store is not writable" || ok "/nix/store is not writable"
-J bash -c "echo x > /var/t" 2>/dev/null && bad "/var is not writable" || ok "/var is not writable"
+
+# ---- 2b. system dirs are private tmpfs, host content invisible (M7) -----------
+# /var /srv /mnt /media (whichever exist on the host) are overlaid with tmpfs:
+# a job sees empty writable dirs, never the host's /var/lib, mounts, media.
+for d in /var /srv /mnt /media; do
+  [ -d "$d" ] || continue
+  J stat -f -c %T "$d" 2>/dev/null | grep -q tmpfs \
+    && ok "$d is a tmpfs (not the host's)" || bad "$d is a tmpfs (host fs visible: $(J stat -f -c %T "$d" 2>/dev/null))"
+  J bash -c "echo x > '$d/bento-write-test'" 2>/dev/null \
+    && ok "$d is writable in the jail (ephemeral tmpfs)" || bad "$d is writable in the jail (ephemeral tmpfs)"
+done
+# a host dir that must not leak through: /var/lib always has content
+J bash -c '[ ! -e /var/lib/systemd ] && [ ! -e /var/lib/nixos ]' \
+  && ok "host /var/lib content is invisible" || bad "host /var/lib content is visible in the jail"
+[ ! -e /var/bento-write-test ] && ok "jail /var writes never reach the host" || bad "a jail write reached the host /var"
 
 # ---- 3. invisibility ------------------------------------------------------
 invis() { # name path-that-must-not-exist
@@ -112,6 +126,11 @@ J bash -c "[ \"\${SECRETCANARY:-}\" = \"$CANARY\" ]" 2>/dev/null \
   && bad "wrapper env (canary/credentials) leaks into jail" || ok "wrapper env (canary/credentials) does not leak into jail"
 J bash -c '[ -n "${HOME:-}" ] && [ -n "${PATH:-}" ] && [ "${XDG_RUNTIME_DIR:-}" = /run/user/'"$(id -u)"' ]' \
   && ok "explicit jail env is set (HOME, PATH, XDG_RUNTIME_DIR)" || bad "explicit jail env is set"
+# M1: even when the wrapper itself runs on a terminal (script gives it a pty),
+# the jailed job must have NO controlling tty — /dev/tty must not openable
+script -qefc "$GJ $FOREST -- bash -c '(exec 3<>/dev/tty) 2>/dev/null && echo HAS-CTTY || echo NO-CTTY'" /dev/null </dev/null 2>&1 | grep -q NO-CTTY \
+  && ok "jail has no controlling tty (bwrap --new-session)" \
+  || bad "jail has no controlling tty (bwrap --new-session)"
 
 # ---- 5. no network ----------------------------------------------------------
 J bash -c 'timeout 4 bash -c "exec 3<>/dev/tcp/1.1.1.1/443" 2>/dev/null' \
@@ -240,6 +259,21 @@ J2 bash -c "[ ! -e /home/$USER/projects/repos ]" \
 J2 git status >/dev/null 2>&1 && bad "git status in a checkout fails (no gitdir)" || ok "git status in a checkout fails (no gitdir)"
 J2 git commit -am x >/dev/null 2>&1 && bad "git commit from the jail is impossible" || ok "git commit from the jail is impossible"
 J2 bash -c '[ -f .git ]' && ok "the checkout's .git gitfile itself is still there (harmless)" || bad "the checkout's .git gitfile itself is still there"
+
+# ---- 8b. a checkout with a real .git DIRECTORY: overlayed by a tmpfs (M5) -----
+# Worktrees have a .git FILE (harmless). A checkout that is a plain clone has
+# a real .git dir — the heart of the repo — and the forest bind would expose
+# it rw to the job. The jail overlays each with a tmpfs: writes stay in RAM,
+# the real contents are invisible.
+mkdir -p "$FOREST/repo2/.git"
+echo "real gitdir content" > "$FOREST/repo2/.git/HEAD-marker"
+J bash -c "echo pwn > '$FOREST/repo2/.git/pwned'" 2>/dev/null \
+  && ok "a checkout's .git dir is writable in jail (tmpfs)" || bad "a checkout's .git dir is writable in jail (tmpfs)"
+[ ! -e "$FOREST/repo2/.git/pwned" ] \
+  && ok "writes into a checkout .git never reach the host (tmpfs overlay)" \
+  || bad "a job wrote into a checkout's real .git"
+J bash -c "[ ! -e '$FOREST/repo2/.git/HEAD-marker' ]" \
+  && ok "the real .git contents are hidden in the jail" || bad "real .git contents visible in jail"
 
 # ---- summary ------------------------------------------------------------
 echo
