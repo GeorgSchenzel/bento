@@ -106,6 +106,22 @@ pub fn discover() -> Result<Forest> {
     })
 }
 
+/// The forest at a known dir. For callers that cannot discover from their
+/// own cwd — the bridge daemon's handoff (§5), which is handed the new
+/// forest's path. Only workforests: that is all a handoff creates; a
+/// single checkout is reached through `discover`.
+pub fn at(dir: &Path) -> Result<Forest> {
+    let dir = fs::canonicalize(dir)
+        .with_context(|| format!("resolving the forest dir {}", dir.display()))?;
+    if !is_workforest(&dir) {
+        bail!(
+            "{} is not a forest (expected <root>/forests/<name> with a repos/ sibling)",
+            dir.display()
+        );
+    }
+    workforest(&dir, &dir)
+}
+
 /// `<root>/forests/<name>`; the `repos/` sibling tells forest's layout
 /// apart from any dir that happens to be called "forests".
 fn is_workforest(dir: &Path) -> bool {
@@ -326,4 +342,37 @@ fn detect_worktree(dir: &Path) -> Option<WorktreeGit> {
     let wt_id = wt_git.file_name()?.to_string_lossy().into_owned();
     let main_git = fs::canonicalize(wt_git.join("../..")).ok()?;
     Some(WorktreeGit { main_git, wt_id })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake checkout: a dir with a .git file (a worktree pointer is not
+    /// needed for `at` to see the tree).
+    fn fake_forest(root: &Path, name: &str) -> PathBuf {
+        let dir = root.join("forests").join(name);
+        fs::create_dir_all(dir.join("bento")).unwrap();
+        fs::write(dir.join("bento").join(".git"), "gitdir: /nowhere\n").unwrap();
+        dir
+    }
+
+    #[test]
+    fn at_reads_a_known_workforest() {
+        let root = std::env::temp_dir().join(format!("bento-forest-at-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("repos")).unwrap();
+        let dir = fake_forest(&root, "spike-f3-made");
+        let f = at(&dir).unwrap();
+        assert_eq!(f.name, "bento-forest_spike-f3-made");
+        assert_eq!(f.dir, dir.canonicalize().unwrap());
+        assert_eq!(f.trees.len(), 1);
+        assert_eq!(f.trees[0].name, "bento");
+        // the exact forest dir only, not a checkout inside it
+        assert!(at(&dir.join("bento")).is_err());
+        // not a workforest: refused, not guessed
+        assert!(at(&root.join("repos").join("bento")).is_err());
+        assert!(at(&root).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
 }

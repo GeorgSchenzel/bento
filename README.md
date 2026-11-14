@@ -116,11 +116,29 @@ auto-starts it.
   `BENTO_FOREST` (workforests only). The daemon authenticates by the
   token alone; a connection must start with `hello`.
 - Ops (protocol, request and reply shapes: `src/bridge.rs`): `hello`,
-  `forest.ls`, `forest.add`, `forest.name`, `forest.new` (create only; a
-  `brief` handoff is not implemented yet), `gpu.submit`, `gpu.status`,
-  `gpu.ls`. Forest work runs the host's `forest` binary —
+  `forest.ls`, `forest.add`, `forest.name`, `forest.new`, `gpu.submit`,
+  `gpu.status`, `gpu.ls`. Forest work runs the host's `forest` binary —
   `$BENTO_FOREST_BIN`, else `forest` on PATH — as argv, never through a
   shell, always `--no-fetch` for anything that could fetch.
+
+`forest.new` with a `brief` is a **handoff** (decisions §5): after the
+forest itself, the daemon creates and starts the new forest's box
+in-process (the same code path as `bento start`, which also registers the
+hc machine when `BENTO_HC` is set) and starts the first agent on it:
+
+```
+forest new spike-x bento ois --brief - <<< "what to do"
+# → box bento-forest_spike-x, machine spike-x, terminal spike-x/t1 (lead)
+```
+
+The lead agent is `hc run --bg --on <machine> --name lead --cwd /workspace
+opencode "<brief>"`; its brief gets a header naming the calling forest and
+the new one. Without `BENTO_HC` the reply keeps `box` and carries a
+`warning` instead of `machine`/`terminal`. A failure past the forest
+creation names the step and what exists — nothing is deleted; the user
+decides. Measured end-to-end: ~5 s (box create ~2.5 s, machine connect
+~1–2 s), well inside the client's 120 s reply timeout, so the op stays
+synchronous (no background thread, no `.handoff.log`).
 
 ### GPU jobs (`gpu.*`)
 

@@ -211,11 +211,10 @@ pub struct Caller {
     /// The workforest's dir name; None for a single checkout's box.
     pub forest: Option<String>,
     /// The hc machine name (decisions §4), from bridge.json.
-    #[allow(dead_code)] // first read by F3 (the handoff) and ois
+    #[allow(dead_code)] // read by ois, not by any bridge op yet
     pub machine: String,
     /// The daemon's runtime handle: a handler that must call bento's async
     /// code (F3's handoff creates a box) uses it from its own thread.
-    #[allow(dead_code)] // first read by F3/G1; no op needs it yet
     pub rt: tokio::runtime::Handle,
 }
 
@@ -477,16 +476,10 @@ fn forest_name(caller: &Caller, req: &Value) -> Result<Value, BridgeError> {
 }
 
 /// `forest.new`: create a new forest on the host. Without a brief that is
-/// all; with one it becomes a handoff (new box, first agent), which F3
-/// adds. Always `--no-fetch --create-only`: fetching is the user's, and
-/// never join an existing forest (e.g. the user's).
+/// all; with one it becomes a handoff (§5): the new forest gets a box and
+/// its first agent. Always `--no-fetch --create-only`: fetching is the
+/// user's, and never join an existing forest (e.g. the user's).
 fn forest_new(caller: &Caller, req: &Value) -> Result<Value, BridgeError> {
-    if req.get("brief").map(|b| !b.is_null()).unwrap_or(false) {
-        return Err(BridgeError::new(
-            "failed",
-            "handoff not implemented yet (F3 adds the brief: a new box and a first agent)",
-        ));
-    }
     let name = string_field(req, "name")?;
     valid_forest_name(&name)?;
     let repos = string_list(req, "repos")?;
@@ -500,15 +493,163 @@ fn forest_new(caller: &Caller, req: &Value) -> Result<Value, BridgeError> {
     if let Some(from) = &from {
         valid_branch(from)?;
     }
+    let brief = match opt_string_field(req, "brief")? {
+        Some(b) if b.trim().is_empty() => {
+            return Err(BridgeError::new("bad_request", "'brief' must not be empty"));
+        }
+        b => b,
+    };
     validate_repos(caller, &repos)?;
     // any cwd works (forest resolves its root); the forest root's parent
     // keeps `forest new` away from this box's own forest
     let cwd = caller.path.parent().unwrap_or(&caller.path).to_path_buf();
     let envelope = run_forest(&cwd, &new_args(&name, &repos, from.as_deref()))?;
-    Ok(json!({
-        "name": envelope.get("forest").cloned().unwrap_or(Value::Null),
-        "path": envelope.get("path").cloned().unwrap_or(Value::Null),
-    }))
+    match brief {
+        Some(brief) => {
+            let path = PathBuf::from(
+                envelope
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| BridgeError::new("failed", "forest new output has no path"))?,
+            );
+            handoff(caller, &name, &repos, &path, &brief)
+        }
+        None => Ok(json!({
+            "name": envelope.get("forest").cloned().unwrap_or(Value::Null),
+            "path": envelope.get("path").cloned().unwrap_or(Value::Null),
+        })),
+    }
+}
+
+/// `forest.new` with a brief: everything past the forest itself (decisions
+/// §5). Steps 2-4 — the box (which registers the machine, §4), then the
+/// first agent on it. A failure names the step and what exists, because
+/// nothing is deleted automatically: the user decides.
+fn handoff(
+    caller: &Caller,
+    name: &str,
+    repos: &[String],
+    path: &Path,
+    brief: &str,
+) -> Result<Value, BridgeError> {
+    // 2. the box, through the same code path `bento start` takes, on the
+    // daemon's runtime (the connection handler is a plain thread)
+    let forest = crate::forest::at(path)
+        .map_err(|e| handoff_error("reading the new forest", &e, name, path, None, None))?;
+    let box_name = forest.name.clone();
+    if let Err(e) = caller.rt.block_on(crate::sandbox::create(&forest)) {
+        let created = caller.rt.block_on(async {
+            microsandbox::sandbox::Sandbox::get(&forest.name)
+                .await
+                .is_ok()
+        });
+        return Err(handoff_error(
+            "creating its box",
+            &e,
+            name,
+            path,
+            Some((&box_name, created)),
+            None,
+        ));
+    }
+    // 3. the machine: registered by the same create (warns on failure);
+    // everyone reads the name from the box's bridge identity (§4)
+    let machine = match sandbox_machine(&forest) {
+        Ok(m) => m,
+        Err(e) => {
+            return Err(handoff_error(
+                "reading the box's bridge identity",
+                &e,
+                name,
+                path,
+                Some((&box_name, true)),
+                None,
+            ))
+        }
+    };
+    if !crate::herdr::configured() {
+        return Ok(json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "box": box_name,
+            "warning": "no hc core configured; start an agent with `bento opencode`",
+        }));
+    }
+    // 4. the first agent: `hc run --bg --name lead --cwd /workspace opencode`
+    let task = handoff_brief(caller, name, repos, brief);
+    match crate::herdr::handoff_lead(&machine, &task) {
+        Ok(terminal) => Ok(json!({
+            "name": name,
+            "path": path.display().to_string(),
+            "box": box_name,
+            "machine": machine,
+            "terminal": terminal,
+        })),
+        Err(e) => Err(handoff_error(
+            "starting its first agent",
+            &e,
+            name,
+            path,
+            Some((&box_name, true)),
+            Some(&machine),
+        )),
+    }
+}
+
+/// The brief the lead agent gets: a header naming the handoff — who asked,
+/// what the forest holds — then the requester's task. The header also
+/// guarantees the text never starts with a flag (`hc run` parses those).
+fn handoff_brief(caller: &Caller, name: &str, repos: &[String], brief: &str) -> String {
+    let from = caller
+        .forest
+        .clone()
+        .unwrap_or_else(|| caller.box_name.clone());
+    format!(
+        "Handoff from forest {from} (agent request). Your forest: {name}, repos {}. Task:\n\n{}",
+        repos.join(", "),
+        brief.trim()
+    )
+}
+
+/// What a handoff error says: the step that failed, the cause, and what
+/// exists now — nothing is removed behind the caller's back.
+fn handoff_error(
+    step: &str,
+    cause: &anyhow::Error,
+    name: &str,
+    path: &Path,
+    box_name: Option<(&str, bool)>,
+    machine: Option<&str>,
+) -> BridgeError {
+    let what_exists = format!(
+        "forest '{name}' at {} (kept; nothing was deleted), box {}, machine {}",
+        path.display(),
+        match box_name {
+            Some((b, true)) => format!("'{b}' created"),
+            Some((b, false)) => format!("'{b}' not created"),
+            None => "not reached".into(),
+        },
+        match machine {
+            Some(m) => format!("'{m}'"),
+            None => "not reached".into(),
+        },
+    );
+    BridgeError::new(
+        "failed",
+        format!(
+            "the handoff stopped at '{step}': {cause:#}. Exists now: {what_exists}. \
+             Finish it by hand (`bento start` in {path}, then `hc run --bg --on <machine> \
+             --name lead --cwd /workspace opencode \"<brief>\"`) or remove what you do not want",
+            path = path.display(),
+        ),
+    )
+}
+
+/// The new box's machine name, from the bridge identity create just wrote
+/// (§4: bridge.json is the one record everyone reads).
+fn sandbox_machine(forest: &crate::forest::Forest) -> Result<String, anyhow::Error> {
+    let state = crate::sandbox::state_dir(forest)?;
+    Ok(ensure_box_info(&state, &forest.name, &forest.dir)?.machine)
 }
 
 /// These ops act on "this forest", which a single checkout's box has not.
@@ -1050,16 +1191,26 @@ mod tests {
             assert_eq!(err.code, code, "{op}");
             assert!(err.message.contains(needle), "{op}: {}", err.message);
         }
-        // the handoff (a brief) is F3's, and says so
+        // a brief now routes into the handoff (F3); before any forest runs,
+        // the same validations answer (here: a bad name)
         let err = dispatch(
             &daemon,
             &caller,
             "forest.new",
-            &json!({"op": "forest.new", "name": "x", "repos": ["bento"], "brief": "do it"}),
+            &json!({"op": "forest.new", "name": "a:b", "repos": ["bento"], "brief": "do it"}),
         )
         .unwrap_err();
-        assert_eq!(err.code, "failed");
-        assert!(err.message.contains("F3"));
+        assert_eq!(err.code, "bad_request");
+        // an empty brief never starts a half-told agent
+        let err = dispatch(
+            &daemon,
+            &caller,
+            "forest.new",
+            &json!({"op": "forest.new", "name": "ok", "repos": ["bento"], "brief": "  "}),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, "bad_request");
+        assert!(err.message.contains("brief"), "{}", err.message);
     }
 
     #[test]
@@ -1155,6 +1306,64 @@ mod tests {
             assert!(valid_forest_name(bad).is_err(), "{bad}");
         }
         assert!(valid_forest_name("spike-x").is_ok());
+    }
+
+    /// The lead agent's brief: the §5 header (who asked, what the forest
+    /// is), then the requester's task — and never flag-shaped at the start.
+    #[test]
+    fn handoff_briefs_carry_the_header() {
+        let mut caller = caller_at(&tempdir("hb"));
+        caller.forest = Some("spike-F3-handoff".into());
+        let brief = handoff_brief(
+            &caller,
+            "spike-f3-made",
+            &["bento".into()],
+            "write ok and stop",
+        );
+        assert_eq!(
+            brief,
+            "Handoff from forest spike-F3-handoff (agent request). Your forest: \
+             spike-f3-made, repos bento. Task:\n\nwrite ok and stop"
+        );
+        assert!(!brief.starts_with('-'), "must not look like an hc flag");
+        // a checkout's box (no forest) is named by its box instead
+        caller.forest = None;
+        assert!(handoff_brief(&caller, "x", &["a".into(), "b".into()], "t")
+            .starts_with("Handoff from forest bento-test (agent request)."));
+    }
+
+    /// A half-made handoff says which step failed and what exists.
+    #[test]
+    fn handoff_errors_report_the_leftovers() {
+        let err = handoff_error(
+            "creating its box",
+            &anyhow!("boom"),
+            "spike-f3-made",
+            Path::new("/home/g/projects/forests/spike-f3-made"),
+            Some(("bento-forest_spike-f3-made", false)),
+            None,
+        );
+        assert_eq!(err.code, "failed");
+        let msg = err.message;
+        assert!(msg.contains("stopped at 'creating its box'"), "{msg}");
+        assert!(msg.contains("boom"), "{msg}");
+        assert!(msg.contains("kept; nothing was deleted"), "{msg}");
+        assert!(
+            msg.contains("'bento-forest_spike-f3-made' not created"),
+            "{msg}"
+        );
+        assert!(msg.contains("machine not reached"), "{msg}");
+        let err = handoff_error(
+            "starting its first agent",
+            &anyhow!("nope"),
+            "n",
+            Path::new("/p"),
+            Some(("b", true)),
+            Some("n"),
+        );
+        assert!(err.message.contains("'b' created"), "{}", err.message);
+        assert!(err.message.contains("machine 'n'"), "{}", err.message);
+        assert!(err.message.contains("hc run --bg"), "{}", err.message);
     }
 
     #[test]

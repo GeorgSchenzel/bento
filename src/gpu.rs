@@ -986,7 +986,9 @@ mod tests {
             exit: None,
             timed_out: None,
         };
-        job("20261113-000100-0000").save(&state.join("queued")).unwrap();
+        job("20261113-000100-0000")
+            .save(&state.join("queued"))
+            .unwrap();
         assert_eq!(queue.queued_before("20261113-235959-zzzz"), 1);
         let _ = fs::remove_file(&bad);
     }
