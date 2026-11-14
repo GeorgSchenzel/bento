@@ -133,7 +133,19 @@ fn try_register(forest: &Forest) -> Result<()> {
     let Some(hc) = hc_bin() else {
         return Ok(());
     };
-    let machine = machine_at(&forest.dir, &sandbox::state_dir(forest)?);
+    let state = sandbox::state_dir(forest)?;
+    let machine = machine_at(&forest.dir, &state);
+    // M2: never replace a machine another box owns. Two boxes can claim one
+    // name when their bridge.json files predate unique naming; the rm+add
+    // "replace" would rewire that box's machine to ours, and the rm alone
+    // (register's error path) would disconnect it. Refusing leaves the
+    // other box's entry as it is; the collision is fixed on the host.
+    if let Some(owner) = bridge::machine_owner(&state, &machine) {
+        bail!(
+            "machine '{machine}' is claimed by box '{owner}' too; not re-registering \
+             (rename one of the forests, or fix that box's bridge.json)"
+        );
+    }
     // replace, not add: `machine add` is not idempotent (name_taken), and a
     // recreated box core has a new id anyway
     let _ = run(&hc, &rm_args(&machine));
@@ -145,7 +157,9 @@ fn try_register(forest: &Forest) -> Result<()> {
 /// Remove a box's machine entry (`bento rm` and `prune`), before the state
 /// dir — which holds the machine's name — goes. Silent: a machine that was
 /// never added (box never started with `BENTO_HC`, or a single checkout's
-/// box, which is never registered) is the normal case.
+/// box, which is never registered) is the normal case. A machine another
+/// box still claims is left alone (M2): whose connection it is cannot be
+/// told from here.
 pub fn unregister(dir: &Path, box_name: &str) {
     if bridge::workforest_name(dir).is_none() {
         return;
@@ -153,10 +167,17 @@ pub fn unregister(dir: &Path, box_name: &str) {
     let Some(hc) = hc_bin() else {
         return;
     };
-    let machine = match sandbox::box_state_dir(box_name) {
-        Ok(state) => machine_at(dir, &state),
+    let state = match sandbox::box_state_dir(box_name) {
+        Ok(state) => state,
         Err(_) => return,
     };
+    let machine = machine_at(dir, &state);
+    if let Some(owner) = bridge::machine_owner(&state, &machine) {
+        eprintln!(
+            "bento: hc machine '{machine}' is also claimed by box '{owner}'; leaving it registered"
+        );
+        return;
+    }
     if run(&hc, &rm_args(&machine)).is_ok() {
         eprintln!("hc machine '{machine}': unregistered");
     }
@@ -258,6 +279,163 @@ fn run(hc: &Path, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Guards HOME, BENTO_HC and MSB_*: cargo runs one binary's tests in
+    /// parallel threads with one environment.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Poisoned only by a panicked holder; the next test can still run.
+    fn lock_env() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn tempdir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("bento-herdr-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A forest-shaped layout around `forests/<name>`, plus a fake `hc`
+    /// that records what it was asked to do; HOME points into the temp
+    /// root, so the state dirs land there too. The guard restores every
+    /// env var it touched, even on a failed assert.
+    struct Vars(Vec<(&'static str, Option<String>)>);
+    impl Drop for Vars {
+        fn drop(&mut self) {
+            for (key, was) in self.0.drain(..).rev() {
+                match was {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn fake_hc_env(root: &Path, calls: &Path, vars: &mut Vars) -> Forest {
+        let layout = root.join("layout");
+        fs::create_dir_all(layout.join("repos")).unwrap();
+        let dir = layout.join("forests").join("mine");
+        fs::create_dir_all(&dir).unwrap();
+        let hc = root.join("hc.sh");
+        fs::write(
+            &hc,
+            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", calls.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&hc, fs::Permissions::from_mode(0o755)).unwrap();
+            // msb resolution (this SDK version) wants a home layout:
+            // <home>/bin/msb + <home>/lib/libkrunfw.so.<abi>. The soname is
+            // pinned inside microsandbox, so the first failing resolution
+            // tells us the exact pair to fake; neither file is ever run.
+            let msb_home = root.join("msbhome");
+            vars.0.push(("MSB_HOME", std::env::var("MSB_HOME").ok()));
+            std::env::set_var("MSB_HOME", &msb_home);
+            if let Err(e) = msb_path() {
+                let msg = e.to_string();
+                let pair = msg
+                    .split("expected ")
+                    .nth(1)
+                    .and_then(|rest| rest.split_once(" and "))
+                    .map(|(a, b)| {
+                        (
+                            PathBuf::from(a.trim()),
+                            PathBuf::from(b.split(';').next().unwrap().trim()),
+                        )
+                    })
+                    .expect("an unreadable runtime error");
+                for path in [pair.0, pair.1] {
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    fs::write(&path, "").unwrap();
+                    let _ = fs::set_permissions(&path, fs::Permissions::from_mode(0o755));
+                }
+            }
+            msb_path().expect("the faked msb home resolves");
+        }
+        for (key, value) in [
+            ("HOME", root.display().to_string()),
+            ("BENTO_HC", hc.display().to_string()),
+        ] {
+            vars.0.push((key, std::env::var(key).ok()));
+            std::env::set_var(key, value);
+        }
+        Forest {
+            name: "bento-forest_mine".into(),
+            dir,
+            trees: Vec::new(),
+            cwd: "/workspace".into(),
+        }
+    }
+
+    /// Another box's bridge.json claiming machine `machine`.
+    fn other_box_claims(machine: &str, home: &Path) {
+        let state = home.join(".local/share/bento/boxes/bento-forest_other");
+        fs::create_dir_all(&state).unwrap();
+        fs::write(
+            state.join("bridge.json"),
+            serde_json::to_string(&bridge::BoxInfo {
+                token: "t-other".into(),
+                box_name: "bento-forest_other".into(),
+                path: "/tmp".into(),
+                port: 17761,
+                machine: machine.into(),
+            })
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// M2: a machine another box's bridge.json owns is never `rm`'d and
+    /// re-`add`ed by this box's registration — that would rewire or drop
+    /// the other box's connection — and unregister leaves it alone too.
+    #[test]
+    fn a_claimed_machine_is_never_removed_or_replaced() {
+        let _env = lock_env();
+        let root = tempdir("claimed");
+        let calls = root.join("hc-calls");
+        let mut vars = Vars(Vec::new());
+        let forest = fake_hc_env(&root, &calls, &mut vars);
+        other_box_claims("mine", &root);
+        assert_eq!(
+            bridge::workforest_name(&forest.dir).as_deref(),
+            Some("mine")
+        );
+
+        // register: refuses before hc runs anything
+        let err = try_register(&forest).unwrap_err();
+        assert!(err.to_string().contains("claimed by box"), "{err:#}");
+        assert!(
+            !calls.exists(),
+            "hc must not be called; got: {}",
+            fs::read_to_string(&calls).unwrap_or_default()
+        );
+
+        // unregister: leaves the machine registered
+        unregister(&forest.dir, &forest.name);
+        assert!(
+            !calls.exists(),
+            "hc must not be called; got: {}",
+            fs::read_to_string(&calls).unwrap_or_default()
+        );
+
+        // without the claim, register does the rm+add replace as before
+        fs::remove_dir_all(root.join(".local/share/bento/boxes/bento-forest_other")).unwrap();
+        try_register(&forest).unwrap();
+        let done = fs::read_to_string(&calls).unwrap_or_default();
+        assert!(done.contains("machine rm mine"), "{done}");
+        assert!(done.contains("machine add --name mine --via "), "{done}");
+
+        // and unregister removes it again
+        fs::write(&calls, "").unwrap();
+        unregister(&forest.dir, &forest.name);
+        let done = fs::read_to_string(&calls).unwrap_or_default();
+        assert!(done.contains("machine rm mine"), "{done}");
+        drop(vars); // explicit, though Drop would run anyway
+    }
 
     /// Decisions §5's run, argv never a shell; the brief is one argument.
     #[test]
