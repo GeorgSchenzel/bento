@@ -66,7 +66,21 @@ J bash -c "echo x > \$HOME/hometest" && [ ! -e "$HOME/hometest" ] \
 J bash -c "echo x > /dev/shm/s" && ok "/dev/shm is writable" || bad "/dev/shm is writable"
 J bash -c "echo x > /etc/t" 2>/dev/null && bad "/etc is not writable" || ok "/etc is not writable"
 J bash -c "echo x > /nix/store/t" 2>/dev/null && bad "/nix/store is not writable" || ok "/nix/store is not writable"
-J bash -c "echo x > /var/t" 2>/dev/null && bad "/var is not writable" || ok "/var is not writable"
+
+# ---- 2b. system dirs are private tmpfs, host content invisible (M7) -----------
+# /var /srv /mnt /media (whichever exist on the host) are overlaid with tmpfs:
+# a job sees empty writable dirs, never the host's /var/lib, mounts, media.
+for d in /var /srv /mnt /media; do
+  [ -d "$d" ] || continue
+  J stat -f -c %T "$d" 2>/dev/null | grep -q tmpfs \
+    && ok "$d is a tmpfs (not the host's)" || bad "$d is a tmpfs (host fs visible: $(J stat -f -c %T "$d" 2>/dev/null))"
+  J bash -c "echo x > '$d/bento-write-test'" 2>/dev/null \
+    && ok "$d is writable in the jail (ephemeral tmpfs)" || bad "$d is writable in the jail (ephemeral tmpfs)"
+done
+# a host dir that must not leak through: /var/lib always has content
+J bash -c '[ ! -e /var/lib/systemd ] && [ ! -e /var/lib/nixos ]' \
+  && ok "host /var/lib content is invisible" || bad "host /var/lib content is visible in the jail"
+[ ! -e /var/bento-write-test ] && ok "jail /var writes never reach the host" || bad "a jail write reached the host /var"
 
 # ---- 3. invisibility ------------------------------------------------------
 invis() { # name path-that-must-not-exist

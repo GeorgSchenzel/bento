@@ -77,6 +77,11 @@
 #                                           XWayland without an Xauthority file)
 #   /nix/var          -> /nix/var    new   tmpfs hides the nix daemon socket — else a jailed
 #                                           `nix build` could write the store via the daemon
+#   /var, /srv,       -> themselves  new   tmpfs over each (M7) that exists on the host: jobs
+#   /mnt, /media                            see empty writable dirs, never host /var/lib,
+#                                           mounts or media (bwrap needs an existing
+#                                           mountpoint; a host path that doesn't exist is
+#                                           already invisible through the ro /)
 #   /proc             -> /proc       new   fresh procfs for the unshared pid ns
 # Not bound: /run/user/<uid>/bus (dbus), pipewire/pulse (audio) — add per need later.
 #
@@ -202,6 +207,18 @@ for d in "$forest"/*/; do
   git_overlays+=(--tmpfs "${d%/}/.git")
 done
 
+# System dirs with host content that a job has no business seeing become
+# private writable tmpfs (M7): /var (lib, log, db…), /srv, /mnt, /media —
+# whichever of them exist on the host (bwrap needs an existing mountpoint,
+# and a path the host does not have is invisible through the ro / anyway).
+# Nothing in the graphics stack needs host /var: mesa/vulkan state lives in
+# $XDG_CACHE_HOME (the ephemeral home) and /run/opengl-driver; fontconfig
+# regenerates its cache per job.
+sys_tmpfs=()
+for d in /var /srv /mnt /media; do
+  [ -d "$d" ] && sys_tmpfs+=(--tmpfs "$d")
+done
+
 env_job=()
 [ -n "${GPU_JOB_DIR:-}" ] && env_job+=(--setenv GPU_JOB_DIR "$GPU_JOB_DIR")
 [ -n "${GPU_JOB_FILES:-}" ] && env_job+=(--setenv GPU_JOB_FILES "$GPU_JOB_FILES")
@@ -232,6 +249,7 @@ env_job=()
   --bind "$forest" "$forest" \
   "${git_overlays[@]}" \
   --tmpfs /nix/var \
+  "${sys_tmpfs[@]}" \
   --proc /proc \
   --unshare-net \
   --unshare-pid \
