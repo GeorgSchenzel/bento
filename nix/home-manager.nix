@@ -68,7 +68,23 @@ in
       example = lib.literalExpression ''
         {
           channels.wok.socket = "~/.local/share/wok/wok.sock";
-          git."github.com" = "~/.config/bento/secrets/github";
+        }
+      '';
+    };
+
+    git = lib.mkOption {
+      type = lib.types.attrsOf lib.types.str;
+      default = { };
+      description = ''
+        A token file per git host (the global config's `git`), for https
+        clones and pushes in every box. Paths outside the nix store (e.g.
+        sops-nix's), `~` is HOME; only the path goes into the config. A missing
+        file is a warning at boot: that host gets no credentials.
+      '';
+      example = lib.literalExpression ''
+        {
+          "github.com" = "~/.config/sops-nix/secrets/git/github-com";
+          "gitlab.com" = "~/.config/sops-nix/secrets/git/gitlab-com";
         }
       '';
     };
@@ -82,8 +98,14 @@ in
       };
       tokenFile = lib.mkOption {
         type = lib.types.str;
-        default = "~/.config/bento/secrets/claude";
-        description = "A `claude setup-token` token, as CLAUDE_CODE_OAUTH_TOKEN (read at each exec).";
+        example = "~/.config/sops-nix/secrets/bento/claude-token";
+        description = ''
+          Path of a file holding a `claude setup-token` token, set as
+          CLAUDE_CODE_OAUTH_TOKEN in every exec (read on the host at each exec;
+          only the path goes into the config). No default: an unreadable file
+          fails every exec, enter and cp (125, contracts.md), so set it to where
+          the token really is.
+        '';
       };
       hostConfig = lib.mkOption {
         type = lib.types.listOf lib.types.str;
@@ -130,6 +152,7 @@ in
         home.packages = lib.mkIf supported [ cfg.package ];
         xdg.configFile."bento/config.yaml".source = yaml.generate "bento-config.yaml" cfg.settings;
       }
+      (lib.mkIf (cfg.git != { }) { programs.bento.settings.git = cfg.git; })
       (lib.mkIf claude.enable {
         programs.bento.settings = {
           tools.claude = claude.tool;

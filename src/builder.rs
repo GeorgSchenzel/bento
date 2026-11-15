@@ -97,6 +97,9 @@ impl<'a> Builder<'a> {
         if let Ok(handle) = Sandbox::get(&self.name()).await {
             let reason = match self.stale(&handle)? {
                 Some(reason) => reason,
+                // whatever answers on the port while our builder is down is
+                // someone else's daemon (another instance's, after a reboot)
+                None if !crate::boxes::is_running(handle.status_snapshot()) => "not running",
                 None if !healthy(self.nix_port) => "daemon not answering",
                 None => return Ok(nix),
             };

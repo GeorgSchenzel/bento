@@ -537,7 +537,6 @@ files:
 copy:
   - {guest: ~/.local/share/opencode/auth.json, host: ~/.local/share/opencode/auth.json}
 env:
-  HC_SESSION: stew
   STEW_HUB: unix:/run/bento/stew.sock
   N: 3
 env_files:
@@ -564,7 +563,7 @@ git:
             c.files[0].host,
             Path::new("/home/u/.local/share/stew/skills")
         );
-        assert_eq!(c.env[2], ("N".into(), "3".into()));
+        assert!(c.env.contains(&("N".into(), "3".into())));
         assert_eq!(c.git[1].0, "gitlab.example.com:8443");
         assert_eq!(c.channel_ports()[1].1, CHANNEL_PORT_BASE + 1);
     }

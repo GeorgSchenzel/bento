@@ -110,11 +110,15 @@ fn git_value(v: &str) -> String {
     format!("\"{}\"", clean.replace('\\', "\\\\").replace('"', "\\\""))
 }
 
-/// The box's system git config: a credential helper per configured host,
+/// The box's system git config: a credential helper per configured host
+/// whose token file is there (`present[i]`; missing ones were warned about),
 /// the host's identity if it has one.
-pub fn gitconfig(config: &Config, identity: Option<(&str, &str)>) -> String {
+pub fn gitconfig(config: &Config, present: &[bool], identity: Option<(&str, &str)>) -> String {
     let mut out = String::new();
     for (i, (host, _)) in config.git.iter().enumerate() {
+        if !present.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         out.push_str(&format!(
             "[credential \"https://{host}\"]\n\thelper =\n\thelper = {}\n",
             git_value(&format!("/etc/bento/git-credential-{i}"))
@@ -145,6 +149,8 @@ pub struct BootInput<'a> {
     pub home: &'a Path,
     /// For each `files` entry: whether its host side is a dir.
     pub files_are_dirs: Vec<bool>,
+    /// For each `git` entry: whether its token file is there (and mounted).
+    pub git_present: Vec<bool>,
     pub identity: Option<(String, String)>,
 }
 
@@ -193,10 +199,13 @@ rofile() {{
         .map(|(n, e)| (n.as_str(), e.as_str()));
     s.push_str(&format!(
         "printf %s {} > {GITCONFIG}\n",
-        q(&gitconfig(c, identity))
+        q(&gitconfig(c, &input.git_present, identity))
     ));
     s.push_str("rm -f /etc/bento/git-credential-*\n");
     for (i, (host, _)) in c.git.iter().enumerate() {
+        if !input.git_present.get(i).copied().unwrap_or(false) {
+            continue;
+        }
         let path = format!("/etc/bento/git-credential-{i}");
         s.push_str(&format!(
             "printf %s {} > {path}\nchmod 755 {path}\n",
@@ -340,9 +349,12 @@ git: {github.com: /t1, gitlab.com: /t2}
 
     #[test]
     fn gitconfig_quotes_identity() {
-        let g = gitconfig(&cfg(), Some(("A \"b\" \\c\n[core]", "a@b")));
+        let g = gitconfig(&cfg(), &[true, true], Some(("A \"b\" \\c\n[core]", "a@b")));
         assert!(g.contains("[credential \"https://github.com\"]"));
         assert!(g.contains("helper = \"/etc/bento/git-credential-1\""));
+        // a host whose token file is missing gets no helper
+        let partial = gitconfig(&cfg(), &[true, false], None);
+        assert!(partial.contains("git-credential-0") && !partial.contains("git-credential-1"));
         assert!(g.contains("name = \"A \\\"b\\\" \\\\c[core]\""));
         assert_eq!(g.matches("[core]").count(), 1); // inside a quoted value only
         assert!(!g.contains("\n[core]"));
@@ -383,6 +395,7 @@ git: {github.com: /t1, gitlab.com: /t2}
             config: &c,
             home: Path::new("/home/u"),
             files_are_dirs: vec![true],
+            git_present: vec![true; 2],
             identity: Some(("n".into(), "e".into())),
         });
         assert!(s.contains("rofile /bento/files/0 '/home/u/it'\\''s $(x)' dir\n"));

@@ -66,7 +66,8 @@ fn read_pid(path: &Path) -> i32 {
 fn bento_run() {
     let Some(run) = build() else { return };
     let code = |args: &[&str]| {
-        Command::new(&run).arg("/")
+        Command::new(&run)
+            .arg("/")
             .args(args)
             .stdin(Stdio::null())
             .output()
@@ -92,13 +93,27 @@ fn bento_run() {
     nodir.args(["/no/such/dir", "true"]).stdin(Stdio::null());
     assert_eq!(nodir.output().unwrap().status.code(), Some(125));
     let mut pwd = Command::new(&run);
-    let out = pwd.args(["/tmp", "pwd"]).stdin(Stdio::null()).output().unwrap();
+    let out = pwd
+        .args(["/tmp", "pwd"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
     assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "/tmp");
     let mut nocmd = Command::new(&run);
-    assert_eq!(nocmd.arg("/").stdin(Stdio::null()).output().unwrap().status.code(), Some(125));
+    assert_eq!(
+        nocmd
+            .arg("/")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap()
+            .status
+            .code(),
+        Some(125)
+    );
 
     // stdout and stderr pass through byte-exact
-    let out = Command::new(&run).arg("/")
+    let out = Command::new(&run)
+        .arg("/")
         .args(["sh", "-c", "printf 'a\\0b'; printf e >&2"])
         .output()
         .unwrap();
@@ -107,7 +122,8 @@ fn bento_run() {
 
     // a forwarded signal reaches the command, whose exit code comes back
     let marker = tmpfile("fwd");
-    let mut child = Command::new(&run).arg("/")
+    let mut child = Command::new(&run)
+        .arg("/")
         .args([
             "sh",
             "-c",
@@ -128,7 +144,8 @@ fn bento_run() {
     // the wrapper SIGKILLed (the caller dropped): SIGHUP reaches the command
     let hup = tmpfile("hup");
     let pidf = tmpfile("hup-pid");
-    let mut child = Command::new(&run).arg("/")
+    let mut child = Command::new(&run)
+        .arg("/")
         .args([
             "sh",
             "-c",
@@ -149,7 +166,8 @@ fn bento_run() {
 
     // ... and SIGKILL after the grace period when it ignores SIGHUP
     let pidf = tmpfile("kill-pid");
-    let mut child = Command::new(&run).arg("/")
+    let mut child = Command::new(&run)
+        .arg("/")
         .args([
             "sh",
             "-c",
@@ -172,7 +190,8 @@ fn bento_run() {
 
     // processes a command leaves behind survive its normal end
     let bgf = tmpfile("bg-pid");
-    let status = Command::new(&run).arg("/")
+    let status = Command::new(&run)
+        .arg("/")
         .args([
             "sh",
             "-c",

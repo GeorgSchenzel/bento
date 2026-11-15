@@ -59,7 +59,7 @@ async fn handle(msb_name: &str) -> Result<Option<SandboxHandle>> {
     }
 }
 
-fn is_running(status: SandboxStatus) -> bool {
+pub(crate) fn is_running(status: SandboxStatus) -> bool {
     matches!(
         status,
         SandboxStatus::Running
@@ -317,9 +317,21 @@ fn mounts(config: &Config, nix: &Path, disk: &Path) -> Result<Mounts> {
     }
     let mut git = vec![];
     for (i, (host, tok)) in config.git.iter().enumerate() {
-        let tok = std::fs::canonicalize(tok)
-            .map_err(|err| fail(fail::OTHER, format!("git.{host}: {}: {err}", tok.display())))?;
-        git.push((guest::git_mount(i), tok));
+        match std::fs::canonicalize(tok) {
+            Ok(tok) => git.push((guest::git_mount(i), tok)),
+            // a missing token file leaves that host without credentials, it
+            // doesn't fail the boot (only `files`/`copy`/tools do)
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => eprintln!(
+                "bento: warning: git.{host}: {}: no such file; {host} gets no credentials",
+                tok.display()
+            ),
+            Err(err) => {
+                return Err(fail(
+                    fail::OTHER,
+                    format!("git.{host}: {}: {err}", tok.display()),
+                ))
+            }
+        }
     }
     for e in &config.copy {
         std::fs::metadata(&e.host)
@@ -556,6 +568,7 @@ async fn init(instance: &Instance, config: &Config, st: &mut BoxState, sb: &Sand
             .iter()
             .map(|e| std::fs::metadata(&e.host).is_ok_and(|m| m.is_dir()))
             .collect(),
+        git_present: config.git.iter().map(|(_, tok)| tok.exists()).collect(),
         identity: git_identity(),
     };
     exec::script(sb, &guest::boot_script(&input), &[], &env)
@@ -877,7 +890,10 @@ mod tests {
         };
         let current = [port(5173), port(8080)];
         let want = [port(5173), port(9000)];
-        let stale: Vec<u16> = stale_ports(&current, &want).iter().map(|p| p.host_port).collect();
+        let stale: Vec<u16> = stale_ports(&current, &want)
+            .iter()
+            .map(|p| p.host_port)
+            .collect();
         assert_eq!(stale, vec![8080]);
     }
 
@@ -913,6 +929,17 @@ mod tests {
         assert_eq!(m.files.len(), 1);
         assert!(m.files[0].2);
         assert_eq!(m.git.len(), 1);
+        // a missing git token file is a warning: that host is left out
+        let text = format!(
+            "git: {{github.com: {0}/tok, gitlab.com: {0}/no-such-token}}",
+            d.display()
+        );
+        let c = config::parse(Some(&text), &inst).unwrap();
+        let m = mounts(&c, Path::new("/n"), Path::new("/d.img")).unwrap();
+        assert_eq!(
+            m.git,
+            vec![(guest::git_mount(0), d.join("tok").canonicalize().unwrap())]
+        );
         // a missing host path fails the boot
         let bad = config::parse(
             Some("files: [{guest: /etc/x, host: /nonexistent/bento}]"),

@@ -72,9 +72,13 @@ programs.bento = {
   enable = true;
   settings = {
     channels.wok.socket = "~/.local/share/wok/wok.sock";
-    git."github.com" = "~/.config/bento/secrets/github";
   };
-  agents.claude.enable = true;    # tool, managed settings, ~/.claude config ro, token
+  # token files by path only (e.g. sops-nix's); a missing one is a warning
+  git."github.com" = "~/.config/sops-nix/secrets/git/github-com";
+  agents.claude = {
+    enable = true;                # tool, managed settings, ~/.claude config ro, token
+    tokenFile = "~/.config/sops-nix/secrets/bento/claude-token";
+  };
   agents.opencode.enable = true;  # tool, permissions, auth.json copied in
 };
 ```

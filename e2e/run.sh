@@ -10,10 +10,16 @@
 # by comparing the live msb processes and dirs before and after.
 #
 # Optional:
+#   E2E_GITHUB_TOKEN, E2E_GITLAB_TOKEN  token file paths for github.com and
+#     gitlab.com (default ~/.config/bento/secrets/{github,gitlab}); when the
+#     file is there the box's credential helper is checked against it (by
+#     hash; no token is printed)
 #   E2E_GITHUB_REPO=https://github.com/<you>/<repo>  clone + push a branch (and
-#   E2E_GITLAB_REPO=https://gitlab.com/<you>/<repo>  delete it), with the tokens
-#     in ~/.config/bento/secrets/{github,gitlab}
-#   E2E_AGENTS=1   also build claude and opencode as tools and run --version
+#   E2E_GITLAB_REPO=https://gitlab.com/<you>/<repo>  delete it), with those tokens
+#   E2E_AGENTS=1   also build claude and opencode as tools, set them up as the
+#     home-manager presets do and have each run a shell command unprompted:
+#     E2E_CLAUDE_TOKEN (default ~/.config/bento/secrets/claude) and
+#     E2E_OPENCODE_AUTH (default ~/.local/share/opencode/auth.json), paths
 #   E2E_BENTO_HOME, E2E_NIX_PORT, E2E_LOOPBACK  override the scratch instance
 set -uo pipefail
 
@@ -60,7 +66,8 @@ json_get() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys
 live_snapshot() {
   {
     ls -la --time-style=+%s "$HOME/.microsandbox" "$HOME/.microsandbox/sandboxes" \
-      "$HOME/.local/share/bento" 2>/dev/null | grep -v ' \.\.$' # `..` is $HOME, ~/.local/share: anything touches them
+      "$HOME/.local/share/bento" "$HOME/.local/share/bento/boxes" \
+      "$HOME/.local/share/bento/msb/sandboxes" 2>/dev/null | grep -v ' \.\.$' # `..` is $HOME, ~/.local/share: anything touches them
     for p in /proc/[0-9]*; do
       local c
       c=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null) || continue
@@ -110,13 +117,34 @@ echo copy-1 >"$H/copy.txt"
 printf 'secret-1\n' >"$H/secret"
 echo A >"$H/cpdir/a"
 echo B >"$H/cpdir/sub/b"
-GIT=""
-[ -f "$HOME/.config/bento/secrets/github" ] && GIT+="  github.com: ~/.config/bento/secrets/github"$'\n'
-[ -f "$HOME/.config/bento/secrets/gitlab" ] && GIT+="  gitlab.com: ~/.config/bento/secrets/gitlab"$'\n'
+GH_TOKEN_FILE=${E2E_GITHUB_TOKEN:-$HOME/.config/bento/secrets/github}
+GL_TOKEN_FILE=${E2E_GITLAB_TOKEN:-$HOME/.config/bento/secrets/gitlab}
+# a fake host with a fake token (always), one whose token file is missing (a
+# warning, not a failed boot), and the real ones when their files are there
+printf 'fake-token-1\n' >"$H/fake-token"
+GIT="  git.e2e.invalid: $H/fake-token"$'\n'"  missing.e2e.invalid: $H/no-such-token"$'\n'
+[ -f "$GH_TOKEN_FILE" ] && GIT+="  github.com: $GH_TOKEN_FILE"$'\n'
+[ -f "$GL_TOKEN_FILE" ] && GIT+="  gitlab.com: $GL_TOKEN_FILE"$'\n'
 TOOLS="  hello: github:NixOS/nixpkgs/$REV#hello"$'\n'
+# what the home-manager presets add for the agents (nix/home-manager.nix)
+A_FILES="" A_COPY="" A_ENV="" A_ENVF=""
 if [ "${E2E_AGENTS:-}" = 1 ]; then
+  CLAUDE_TOKEN=${E2E_CLAUDE_TOKEN:-$HOME/.config/bento/secrets/claude}
+  OPENCODE_AUTH=${E2E_OPENCODE_AUTH:-$HOME/.local/share/opencode/auth.json}
   TOOLS+="  claude: github:NixOS/nixpkgs/$REV#claude-code"$'\n'
   TOOLS+="  opencode: github:NixOS/nixpkgs/$REV#opencode"$'\n'
+  echo '{"permissions":{"defaultMode":"bypassPermissions"},"skipDangerousModePermissionPrompt":true}' >"$H/claude-managed.json"
+  echo '{"hasCompletedOnboarding":true}' >"$H/claude-state.json"
+  echo '{"$schema":"https://opencode.ai/config.json","permission":{"edit":"allow","bash":"allow","webfetch":"allow"}}' >"$H/opencode-box.json"
+  A_FILES+="  - {guest: /etc/claude-code/managed-settings.json, host: $H/claude-managed.json}"$'\n'
+  A_FILES+="  - {guest: /etc/opencode-bento/opencode.json, host: $H/opencode-box.json}"$'\n'
+  [ -e "$HOME/.config/opencode/opencode.json" ] &&
+    A_FILES+="  - {guest: ~/.config/opencode/opencode.json, host: ~/.config/opencode/opencode.json}"$'\n'
+  A_COPY+="  - {guest: ~/.claude/.claude.json, host: $H/claude-state.json}"$'\n'
+  A_COPY+="  - {guest: ~/.local/share/opencode/auth.json, host: $OPENCODE_AUTH}"$'\n'
+  A_ENV+="  CLAUDE_CONFIG_DIR: $HOME/.claude"$'\n'"  CLAUDE_CODE_SANDBOXED: \"1\""$'\n'
+  A_ENV+="  OPENCODE_CONFIG: /etc/opencode-bento/opencode.json"$'\n'
+  A_ENVF+="  CLAUDE_CODE_OAUTH_TOKEN: $CLAUDE_TOKEN"$'\n'
 fi
 write_config() {
   cat >"$BH/config.yaml" <<EOF
@@ -128,15 +156,20 @@ tools:
 $TOOLS
 files:
   - {guest: ~/.config/e2e-ro, host: $H/ro}
+  - {guest: /etc/e2e-ro-file, host: $H/ro/file}
+$A_FILES
 copy:
   - {guest: /etc/e2e-copy, host: $H/copy.txt}
+$A_COPY
 env:
   E2E_ENV: one
+$A_ENV
 $1
 env_files:
   E2E_SECRET: $H/secret
-${GIT:+git:
-$GIT}
+$A_ENVF
+git:
+$GIT
 EOF
 }
 write_config ""
@@ -192,6 +225,7 @@ expect_code "cp with two box paths is 120" 120 bento cp a:/x b:/y
 
 section "create"
 expect_code "create p0-a" 0 bento create p0-a
+check "a missing git token file is a warning" grep -q 'warning: git.missing.e2e.invalid' "$H/last.err"
 check "ls shows p0-a running" sh -c "'$B' ls --json | grep -q '\"name\":\"p0-a\",\"state\":\"running\"'"
 expect_code "create of an existing name is 123" 123 bento create p0-a
 expect_code "docker answers right after create" 0 bx p0-a -- docker info
@@ -234,12 +268,19 @@ check "a dropped connection hangs up the command" test "$(out_of p0-a -- cat /wo
 
 section "files, copy, tools"
 check "files: read-only file content" test "$(out_of p0-a -- cat "$HOME/.config/e2e-ro/file")" = ro-content
+check "files: a single file" test "$(out_of p0-a -- cat /etc/e2e-ro-file)" = ro-content
+expect_code "files: a single file is not writable" 1 bx p0-a -- sh -c "echo x > /etc/e2e-ro-file || exit 1"
 expect_code "files: not writable" 1 bx p0-a -- sh -c "echo x > $HOME/.config/e2e-ro/file || exit 1"
 check "copy: copied in" test "$(out_of p0-a -- cat /etc/e2e-copy)" = copy-1
 check "tools: on PATH" sh -c "'$B' exec p0-a -- hello </dev/null | grep -q 'Hello, world'"
 if [ "${E2E_AGENTS:-}" = 1 ]; then
   expect_code "claude runs" 0 bx p0-a -- claude --version
   expect_code "opencode runs" 0 bx p0-a -- opencode --version
+  # unprompted: without the permission settings the shell command is denied
+  bx p0-a -- timeout 300 claude -p "Use the Bash tool to run exactly this command: touch /workspace/claude-ran . Then reply done." >"$H/claude.out" 2>&1
+  check "claude runs a shell command without a permission prompt" bx p0-a -- test -e /workspace/claude-ran
+  bx p0-a -- timeout 300 opencode run "Use your bash tool to run exactly this command: touch /workspace/opencode-ran . Then reply done." >"$H/opencode.out" 2>&1
+  check "opencode runs a shell command without a permission prompt" bx p0-a -- test -e /workspace/opencode-ran
 else
   skip "claude and opencode as tools (E2E_AGENTS=1)"
 fi
@@ -348,18 +389,39 @@ expect_code "cp of a missing source is 125" 125 bento cp p0-a:/no/such "$H/x"
 expect_code "cp into a missing parent is 125" 125 bento cp "$H/cpdir/a" p0-a:/no/such/dir/a
 
 section "git"
+cred() { # <host>: the box's credential helper's answer
+  printf 'protocol=https\nhost=%s\n\n' "$1" | "$B" exec p0-a -i -- git credential fill 2>/dev/null
+}
+check "git: the helper answers with the token file" \
+  test "$(cred git.e2e.invalid)" = "protocol=https
+host=git.e2e.invalid
+username=oauth2
+password=fake-token-1"
+check "git: no helper for a host whose token file is missing" \
+  sh -c "! printf 'protocol=https\nhost=missing.e2e.invalid\n\n' | '$B' exec p0-a -i -e GIT_TERMINAL_PROMPT=0 -- git credential fill >/dev/null 2>&1"
+# a real token: compared by hash, never printed
+pw_hash() { sed -n 's/^password=//p' | tr -d '\n' | sha256sum; }
+for hf in "github.com $GH_TOKEN_FILE" "gitlab.com $GL_TOKEN_FILE"; do
+  set -- $hf
+  if [ -f "$2" ]; then
+    check "git: $1's helper gives the token in its file" \
+      test "$(cred "$1" | pw_hash)" = "$(printf 'password=%s\n' "$(cat "$2")" | pw_hash)"
+  else
+    skip "git: $1's helper ($2 missing)"
+  fi
+done
 gitpush() { # <repo url> <what>
   bx p0-a -- sh -c 'cd /workspace && rm -rf gp && git clone -q "$1" gp && cd gp && git checkout -q -b "$2" && git -c user.name=bento-e2e -c user.email=e2e@bento commit -q --allow-empty -m "bento e2e" && git push -q origin "$2" && git push -q origin --delete "$2"' sh "$1" "bento-e2e-$$"
 }
-if [ -n "${E2E_GITHUB_REPO:-}" ] && [ -f "$HOME/.config/bento/secrets/github" ]; then
+if [ -n "${E2E_GITHUB_REPO:-}" ] && [ -f "$GH_TOKEN_FILE" ]; then
   expect_code "GitHub: clone, push a branch, delete it" 0 gitpush "$E2E_GITHUB_REPO"
 else
-  skip "GitHub clone and push (E2E_GITHUB_REPO and ~/.config/bento/secrets/github)"
+  skip "GitHub clone and push (E2E_GITHUB_REPO and $GH_TOKEN_FILE)"
 fi
-if [ -n "${E2E_GITLAB_REPO:-}" ] && [ -f "$HOME/.config/bento/secrets/gitlab" ]; then
+if [ -n "${E2E_GITLAB_REPO:-}" ] && [ -f "$GL_TOKEN_FILE" ]; then
   expect_code "GitLab: clone, push a branch, delete it" 0 gitpush "$E2E_GITLAB_REPO"
 else
-  skip "GitLab clone and push (E2E_GITLAB_REPO and ~/.config/bento/secrets/gitlab)"
+  skip "GitLab clone and push (E2E_GITLAB_REPO and $GL_TOKEN_FILE)"
 fi
 
 section "rm"
