@@ -1,204 +1,93 @@
 # bento
 
-Per-checkout and per-forest [microsandbox](https://microsandbox.dev) boxes
-on a shared nix store, with claude and opencode inside.
+Local [microsandbox](https://microsandbox.dev) VMs for coding agents: each
+**box** has its own data disk (the workspace, HOME, docker), its own
+loopback address for published ports, channels to host unix sockets, git
+credentials, and the shared nix store. No host dir is ever mounted
+read-write: files go in and out with `bento cp` or `bento exec`. bento knows
+nothing of repos or agents; agents are tools and config files (see the
+home-manager presets).
 
-One **builder** VM per host owns a shared nix store and runs `nix-daemon`.
-Every checkout (or git worktree), and every
-[forest](https://github.com/GeorgSchenzel/forest) workforest, gets its own
-**box**: a plain bash sandbox with the checkouts under `/workspace`, the
-store mounted read-only and nix talking to the builder's daemon. Anything you `nix shell` or `nix build` in
-one box lands in the shared store and is reused by all the others.
+The interface (commands, flags, exit codes, `--json`, the config and
+`bento.yaml`) is `contracts.md` v2 in the stew notes; this README is a
+summary.
 
-Runs on macOS on Apple Silicon, and on Linux (x86_64, aarch64) with KVM:
-your user needs read/write access to `/dev/kvm`, usually through the `kvm`
-group.
+Linux (x86_64, aarch64) with KVM. macOS is for later.
 
-## Install
-
-### Home Manager / nix-darwin
-
-```nix
-# your flake
-inputs.bento.url = "github:YOUR_NAME/bento";
-```
-
-```nix
-# your Home Manager configuration
-imports = [ inputs.bento.homeManagerModules.bento ];
-
-programs.bento.enable = true;
-```
-
-Ad-hoc: `nix profile install github:YOUR_NAME/bento`.
-
-### cargo
-
-```sh
-cargo install --locked --path .   # needs rustc >= 1.94
-```
-
-From a clone: `just install` / `just uninstall`.
-
-Either way, then run `bento install` once. It installs the microsandbox
-runtime (0.7.8, into `~/.microsandbox`), creates the store, and builds the
-box tools. The first run downloads about 1–2 GB. Nix on the host is not
-needed. On Linux the nix package brings its own runtime instead. With
-`cargo install` on NixOS, enable `programs.nix-ld`: the released runtime
-expects a standard dynamic loader.
-
-## Usage
-
-Run these from inside a checkout or a forest:
+## Commands
 
 ```
-bento enter      # bash in this checkout's box (created/started on demand)
-bento claude     # claude in the box (args are passed through)
-bento opencode   # opencode in the box (args are passed through)
-bento start      # (re)create the box, applying config changes
-bento stop       # stop the box (the builder keeps running)
-bento rm         # remove the box and its state, archiving its chats
-bento ls         # list the boxes: status, disk use, checkout or forest (gone ones marked)
-bento prune      # remove the boxes whose checkout or forest is gone
-bento builder    # bash in the builder VM
+bento create <name> [-e K=V]… [--json]   make a box and boot it once
+bento start <name> [--json]              boot a stopped box
+bento restart <name> [--json]            stop + start: applies pending ports and a changed config
+bento stop <name>                        processes get SIGHUP, then SIGKILL after 5 s
+bento rm <name> [--force]                the box, its data disk and its state
+bento exec <name> [--no-start] [-i] [-t] [-w dir] [-e K=V]… -- <cmd> [args…]
+bento enter <name> [--no-start] [-w dir] bash in the box
+bento cp <name>:<path> <host path>       docker cp's rules, either direction
+bento ls [--json]
+bento ports <name> [--json]              declared ports, published/busy/pending
+bento claude|opencode <name> [args…]     exec -i -t -- <agent> …
+bento install | builder [restart|rm]     operator commands
 ```
 
-A box holds a forest of checkouts; a single checkout is a forest of one.
-Each checkout is at `/workspace/<project>`, named after the project's dir
-in the host layout (`~/projects/<project>/<branch>` →
-`/workspace/<project>`). Commands start in the guest dir matching the host
-cwd: `/workspace/backend/src` from `backend/src`, `/workspace` from the
-forest root (or the checkout itself, in a forest of one).
-
-- **Checkout:** `bento_<project>` for a main checkout,
-  `bento_<project>_<dir>` for a linked worktree.
-- **Forest:** anywhere inside `<root>/forests/<name>/` (forest's layout,
-  with `<root>/repos/` beside it), including its checkouts, targets the
-  forest's box `bento-forest_<name>`, with every checkout of the forest in
-  it. A checkout added to the forest later shows up after `bento start`.
-
-Boxes are keyed by path: after `forest rm`, `forest clean` or `forest mv`
-the old box and its state (agent history included) are left behind;
-`bento prune` removes them, archiving the chats.
-
-`git commit` works in every checkout and lands in the host repo.
-`/workspace` itself is box-owned (`boxes/<box>/root` on the host), so files
-written there stay out of the host forest dir. Bento writes a short guide to
-the box for the agents there, as `CLAUDE.md` and `AGENTS.md`: what's live on
-the host, the checkouts and their branches, devenv, `just`, nix and docker.
-
-### Agents
-
-The box sees the host's agent config read-only: `~/.claude/{settings.json,
-CLAUDE.md,skills,plugins,agents,commands}` and everything in
-`~/.config/opencode`. Its HOME has the same path as on the host, so absolute
-paths in that config still resolve. Agent state (history, sessions, the
-opencode db) is kept per box in `~/.local/share/bento/boxes/<box>/`.
-Plugins that call host-only binaries won't work in the box.
-
-`bento rm` and `bento prune` first move the box's chats to
-`~/.local/share/bento/archive/<box>-<unix time>/`, and leave the box alone if
-that fails. They keep claude's `history.jsonl` and session transcripts, and
-opencode's db and its WAL. These hold tool output inline and the db holds
-opencode's API keys in plaintext, so the archive is `0700`. Nothing cleans it
-up.
-
-- **claude** and **opencode** run permission-free: bento passes
-  `--dangerously-skip-permissions` / `--auto`, skipped when you pass your own
-  permission flag. The box is the sandbox, and the box-wide `IS_SANDBOX=1`
-  lets claude run permission-free as root. `CLAUDE_CODE_SANDBOXED=1` and a
-  `skipDangerousModePermissionPrompt` setting skip claude's "trust this folder"
-  and bypass-mode prompts, so a checkout's hooks and MCP servers run in the
-  box unasked.
-- **opencode** uses the host's `~/.local/share/opencode/auth.json`
-  (read-only).
-- **claude** doesn't get the host login (on macOS it lives in the Keychain).
-  Create a long-lived token once and save it:
-
-  ```sh
-  claude setup-token   # on the host
-  mkdir -p ~/.config/bento
-  (umask 077; cat > ~/.config/bento/claude-token)  # paste the token, then Ctrl-D
-  ```
-
-  Or set `BENTO_CLAUDE_TOKEN` on the host, which takes precedence over the
-  file. Switch accounts by setting it per run:
-  `BENTO_CLAUDE_TOKEN=$WORK_TOKEN bento claude`.
-
-### devenv
-
-`enter`, `claude` and `opencode` run inside the `devenv shell` of the
-nearest `devenv.nix` up from the cwd, and each checkout's `.devenv` is
-overlaid like `target` (see below). The first activation builds the shell
-through the builder and can take minutes; after that it's cached in the
-shared store.
-
-At the root of a forest with several checkouts there is no devenv shell;
-`cd` into a checkout for its tools. A forest of one starts in its checkout.
-
-### Docker
-
-Every box runs its own `dockerd` (with compose and buildx), started on
-every connect; `docker` just works in `enter`, `claude` and `opencode`.
-Its data root `/var/lib/docker` is an ext4 disk image,
-`boxes/<box>/docker.raw` (docker's overlayfs can't stack on the box's
-overlay rootfs). It is sparse, sized by `quota_gib`, and kept when the box
-is recreated, so pulled images and volumes survive `bento start`; `bento rm`
-deletes it. Ports published with `-p` are reachable inside the box only.
-The image never shrinks on the host; `docker system prune` frees space for
-reuse inside it. Log: `/tmp/dockerd.log` in the box.
-
-### bento.yaml
-
-Optional, at the checkout root (per checkout in a forest):
-
-```yaml
-# Repo dirs the box shadows with its own (linux) copies, kept in the box's
-# state dir, so host and box build artifacts never mix.
-overlay:
-  - target
-# GiB the box may add to each writable mount, and the size of its docker
-# disk (default 64).
-quota_gib: 64
-```
+Exit codes: 120 usage, 121 no such box, 122 not running with `--no-start`,
+123 name exists, 125 any other bento failure; `exec` passes the command's
+code through (126/127 not executable/found, 128+n killed by signal n).
 
 ## How it works
 
-```
-~/.local/share/bento/
-├── store.sparseimage   macOS: case-sensitive APFS, sparse, max 60 GB
-├── store/nix           its mountpoint (Linux: a plain dir, no image);
-│                       /nix for the builder and every box
-└── boxes/<box>/        per-box state: root/ (/workspace), ov/ (overlays),
-                        docker.raw (/var/lib/docker), agent state,
-                        generated git config
+- One **builder** VM per instance owns the store and runs `nix-daemon`,
+  published on host `127.0.0.1:<instance.nix_port>`; boxes mount the store
+  read-only and reach the daemon as `host.microsandbox.internal`. Tools from
+  the config (`tools:`, pinned flake refs) are built by the builder through
+  `exec`, with their own GC roots; the embedded tools (`tools/flake.nix`) hold
+  what bento itself needs in a box.
+- A box's **data disk** is a sparse ext4 image in `$BENTO_HOME/boxes/<name>/`,
+  mounted at `/bento/data`; every boot binds its `workspace`, `home` and
+  `docker` dirs to `/workspace`, HOME (the host's HOME path) and
+  `/var/lib/docker`. It survives stop/start and recreates; `rm` deletes it.
+  The rootfs is reset when a box is recreated (its global config changed).
+- **Ports**: `/workspace/bento.yaml` and `/workspace/<repo>/bento.yaml`
+  (`ports: [5173]`), published at `<box ip>:<port>` when the box boots. msb
+  publishes ports only at a boot, so a port declared later is `pending` until
+  `bento restart`. A port busy on the host is skipped with a warning.
+- **Channels**: a vsock route per global channel, offered in the box as
+  `/run/bento/<name>.sock` by a socat shim started at each boot.
+- **exec** runs every command through `bento-run` (`tools/bento-run.c`), so a
+  dropped connection gives the command SIGHUP, then SIGKILL after 5 s.
+- **Instances**: `BENTO_HOME` (default `~/.local/share/bento`) holds the
+  store, the boxes' state and microsandbox's own home (`MSB_HOME`, at most 56
+  bytes), so a dev instance never sees another's boxes. With `BENTO_HOME` set,
+  the config is `$BENTO_HOME/config.yaml` and must set `instance` (prefix,
+  loopback range, nix_port).
 
-bento-builder           /nix rw, nix-daemon ← socat TCP, 127.0.0.1:17760
-bento_<project>…        /nix ro, /tmp/nix.sock → host.microsandbox.internal:17760
-                        NIX_REMOTE=unix:///tmp/nix.sock
+## Config
+
+`~/.config/bento/config.yaml`, written by home-manager:
+
+```nix
+imports = [ inputs.bento.homeManagerModules.bento ];
+programs.bento = {
+  enable = true;
+  settings = {
+    channels.wok.socket = "~/.local/share/wok/wok.sock";
+    git."github.com" = "~/.config/bento/secrets/github";
+  };
+  agents.claude.enable = true;    # tool, managed settings, ~/.claude config ro, token
+  agents.opencode.enable = true;  # tool, permissions, auth.json copied in
+};
 ```
 
-- The builder is the only process that writes to the store. Locks don't
-  work across microsandbox VMs, so two VMs writing the same store corrupt it.
-- The box tools (claude-code, opencode, devenv, docker, git, just, python3, uv, socat, ncurses) come from a
-  flake that is embedded in the binary (`tools/`). The builder builds it
-  into the GC root `/nix/var/nix/gcroots/bento/tools`, and boxes have its
-  `bin/` on PATH. Changing the flake rebuilds the tools on the next command.
-- Every command checks the builder's health with a nix-daemon handshake.
-  When the check fails, or bento changed, the builder is recreated, never
-  restarted: published ports and background processes don't survive a
-  restart.
-- There is no garbage collection yet; the store only grows (on macOS up to
-  the image cap; on Linux nothing caps its total size). On Linux it needs a
-  filesystem with user xattrs (ext4, btrfs and xfs have them): msb keeps the
-  guest's ownership and modes there.
+Unknown keys fail commands that may boot (125) and are warnings elsewhere.
 
 ## Development
 
 ```sh
-nix develop --no-pure-eval   # same environment as `devenv shell`
+just test   # unit tests, no VM
+just e2e    # VM tests under a scratch BENTO_HOME (/tmp/bento-e2e); host only
 ```
 
-Bumping the `microsandbox` crate means updating the release hashes in
-`nix/package.nix`. Design notes and their evidence: `docs/handoff-shared-store.md`
-and the `experiments/shared-store` branch.
+The SDK is used without its `download-binaries` feature: a build never
+installs a runtime into `~/.microsandbox`. The runtime comes from the nix
+package (`MSB_PATH`, `MSB_LIBKRUNFW_PATH`).

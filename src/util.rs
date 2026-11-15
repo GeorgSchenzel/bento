@@ -1,60 +1,9 @@
 use std::io::Write as _;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use anyhow::{bail, Context as _, Result};
 use microsandbox::sandbox::Sandbox;
 use microsandbox::{ExecEvent, MicrosandboxError};
-
-/// Host HOME. The box uses the same path as its HOME so absolute paths in
-/// host agent config (claude's plugin registry) stay valid inside.
-pub fn home() -> Result<PathBuf> {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .context("HOME is not set")
-}
-
-/// `~/.local/share/bento`: store image, per-box state, host lock.
-pub fn data_dir() -> Result<PathBuf> {
-    let dir = home()?.join(".local/share/bento");
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    Ok(dir)
-}
-
-/// Allocated bytes under a dir, like `du -s` (symlinks are not followed, so
-/// sparse files count what they occupy); a missing dir is 0.
-pub fn disk_usage(path: &Path) -> Result<u64> {
-    use std::os::unix::fs::MetadataExt as _;
-    let meta = match std::fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
-        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
-    };
-    let mut total = meta.blocks() * 512;
-    if meta.is_dir() {
-        for entry in
-            std::fs::read_dir(path).with_context(|| format!("reading {}", path.display()))?
-        {
-            total += disk_usage(&entry?.path())?;
-        }
-    }
-    Ok(total)
-}
-
-/// `1.4G`-style size, powers of 1024 like `du -h`.
-pub fn human_bytes(bytes: u64) -> String {
-    const UNITS: [&str; 5] = ["B", "K", "M", "G", "T"];
-    let mut size = bytes as f64;
-    let mut unit = 0;
-    while size >= 1024.0 && unit < UNITS.len() - 1 {
-        size /= 1024.0;
-        unit += 1;
-    }
-    if unit == 0 || size >= 10.0 {
-        format!("{size:.0}{}", UNITS[unit])
-    } else {
-        format!("{size:.1}{}", UNITS[unit])
-    }
-}
 
 /// FNV-1a: a stable fingerprint for sandbox labels (std's hasher may change
 /// between Rust releases; a changed fingerprint recreates a sandbox).
@@ -67,38 +16,6 @@ pub fn fingerprint(parts: &[&str]) -> String {
         }
     }
     format!("{h:016x}")
-}
-
-/// Host terminal identity and locale for attach sessions; the SDK does not
-/// propagate them, and TUIs (claude, opencode) detect terminal features from
-/// them. The host's terminfo entry and locale go in as BENTO_* for
-/// ATTACH_WRAPPER, which installs / applies them when the box supports them.
-pub fn term_env() -> Vec<(String, String)> {
-    let term = std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into());
-    let mut env = vec![("TERM".to_string(), term.clone())];
-    for key in ["COLORTERM", "TERM_PROGRAM", "TERM_PROGRAM_VERSION"] {
-        if let Ok(value) = std::env::var(key) {
-            env.push((key.to_string(), value));
-        }
-    }
-    for (key, value) in std::env::vars() {
-        if key == "LANG" || key.starts_with("LC_") {
-            env.push((format!("BENTO_{key}"), value));
-        }
-    }
-    let terminfo = std::process::Command::new("infocmp")
-        .args(["-x", &term])
-        .stderr(std::process::Stdio::null())
-        .output();
-    if let Ok(out) = terminfo {
-        if out.status.success() {
-            env.push((
-                "BENTO_TERMINFO".to_string(),
-                String::from_utf8_lossy(&out.stdout).into_owned(),
-            ));
-        }
-    }
-    env
 }
 
 /// The host's primary DNS servers: what msb forwards a sandbox's DNS to. msb
@@ -208,46 +125,56 @@ pub async fn run_streamed(sb: &Sandbox, what: &str, script: String) -> Result<()
     bail!("{what}: lost connection to the sandbox")
 }
 
-/// Installs the host's terminfo entry when the guest has none for TERM (e.g.
-/// xterm-ghostty), falling back to a generic TERM, then execs the command,
-/// inside the nearest devenv up from the cwd when there is one (the tree's;
-/// the forest root has none). devenv itself finds that root. The host locale is applied in there, where devenv's locale archive
-/// is visible: a locale the box lacks becomes C.UTF-8 (built into glibc), or
-/// is dropped if it isn't UTF-8.
-const ATTACH_WRAPPER: &str = r#"if ! infocmp "$TERM" >/dev/null 2>&1; then
-  [ -n "$BENTO_TERMINFO" ] && printf '%s\n' "$BENTO_TERMINFO" | tic -x -o "$HOME/.terminfo" /dev/stdin >/dev/null 2>&1
-  infocmp "$TERM" >/dev/null 2>&1 || export TERM=xterm-256color
-fi
-unset BENTO_TERMINFO
-locale='for k in $(compgen -e); do
-  case $k in BENTO_LANG|BENTO_LC_*) ;; *) continue ;; esac
-  v=${!k}; unset "$k"
-  if [ -z "$(LC_ALL=$v bash -c : 2>&1)" ]; then export "${k#BENTO_}=$v"
-  else case $v in *[Uu][Tt][Ff]*8*) export "${k#BENTO_}=C.UTF-8" ;; esac
-  fi
-done
-exec "$@"'
-d=$PWD
-while [ "$d" != / ] && [ ! -f "$d/devenv.nix" ]; do d=$(dirname "$d"); done
-[ -f "$d/devenv.nix" ] && exec devenv shell -- bash -c "$locale" bash "$0" "$@"
-exec bash -c "$locale" bash "$0" "$@""#;
+/// Quote for a POSIX shell: single quotes, with `'` as `'\''`.
+pub fn sh_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', r"'\''"))
+}
 
-/// Attach an interactive command; returns the process exit code.
-pub async fn attach(
-    sb: &Sandbox,
-    cmd: &str,
-    args: &[String],
-    cwd: &str,
-    envs: Vec<(String, String)>,
-) -> Result<u8> {
-    let argv = ["-c", ATTACH_WRAPPER, cmd]
-        .into_iter()
-        .map(String::from)
-        .chain(args.iter().cloned());
-    let code = sb
-        .attach_with("bash", |a| a.args(argv).cwd(cwd).envs(envs))
-        .await
-        .with_context(|| format!("attaching {cmd}"))?;
-    // negative: detached with the detach keys
-    Ok(if code < 0 { 0 } else { code as u8 })
+/// Write a file through a temp file and a rename, so readers never see half.
+pub fn write_atomic(path: &Path, data: &[u8]) -> Result<()> {
+    let dir = path.parent().context("path without a parent")?;
+    std::fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    let tmp = dir.join(format!(
+        ".{}.tmp-{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("f"),
+        std::process::id()
+    ));
+    std::fs::write(&tmp, data).with_context(|| format!("writing {}", tmp.display()))?;
+    std::fs::rename(&tmp, path).with_context(|| format!("writing {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quoting_round_trips_through_sh() {
+        for s in [
+            "plain",
+            "a b",
+            "it's",
+            "$(rm -rf /)",
+            "`x`",
+            "\\n",
+            "\"q\"",
+            "'",
+            "",
+        ] {
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(format!("printf %s {}", sh_quote(s)))
+                .output()
+                .unwrap();
+            assert_eq!(String::from_utf8(out.stdout).unwrap(), s);
+        }
+    }
+
+    #[test]
+    fn fingerprint_is_stable() {
+        // a changed value recreates every builder and box: never change it
+        assert_eq!(fingerprint(&["a", "b"]), fingerprint(&["a", "b"]));
+        assert_ne!(fingerprint(&["ab"]), fingerprint(&["a", "b"]));
+        assert_eq!(fingerprint(&[]), "cbf29ce484222325");
+    }
 }

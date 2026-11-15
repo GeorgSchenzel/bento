@@ -1,7 +1,8 @@
-# Build and install `bento` into ~/.cargo/bin (replaces any older bento there).
-install:
-    cargo install --path . --locked
+# Unit tests (no VM needed).
+test:
+    nix develop --no-pure-eval -c cargo test
 
-# Remove `bento` from ~/.cargo/bin.
-uninstall:
-    cargo uninstall bento
+# bento's VM tests (plan.md phases 1 and 2) under a scratch BENTO_HOME
+# (/tmp/bento-e2e). Runs on the host, never in a box; see e2e/run.sh.
+e2e:
+    e2e/run.sh

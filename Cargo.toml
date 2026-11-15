@@ -1,15 +1,21 @@
 [package]
 name = "bento"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.94"
 
 [dependencies]
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
-microsandbox = "0.7.8"
-microsandbox-image = "0.7.8" # ext4 formatter for the docker disk
+libc = "0.2"
+# No default features: `download-binaries` makes the SDK's build script install
+# msb into MSB_HOME (by default ~/.microsandbox, the live boxes' runtime) at
+# build time. bento gets its runtime from MSB_PATH (nix/package.nix).
+microsandbox = { version = "=0.7.15", default-features = false, features = ["local", "net"] }
+microsandbox-image = "=0.7.15" # ext4 formatter for the data disk
+microsandbox-types = "=0.7.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tar = { version = "0.4", default-features = false }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "io-std", "io-util", "time", "sync"] }

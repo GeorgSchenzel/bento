@@ -1,23 +1,35 @@
-mod agent;
+mod boxes;
 mod builder;
-mod forest;
-mod sandbox;
+mod config;
+mod cp;
+mod exec;
+mod fail;
+mod guest;
+mod instance;
+mod names;
+mod state;
 mod store;
 mod util;
+mod workspace;
 
 use std::io::IsTerminal as _;
+use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{bail, Result};
+use anyhow::{Context as _, Result};
 use clap::{Parser, Subcommand};
-use microsandbox::setup;
 
-use agent::Agent;
+use instance::Instance;
+
+/// The interface version (contracts.md).
+pub const CONTRACT: u32 = 2;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "bento",
-    about = "Per-checkout and per-forest microsandbox boxes on a shared nix store"
+    about = "Local VM sandboxes for agents: a box with its own disk, per-box ports, channels to host sockets, a shared nix store",
+    version = concat!(env!("CARGO_PKG_VERSION"), " (contract 2)"),
+    disable_help_subcommand = true
 )]
 struct Cli {
     #[command(subcommand)]
@@ -26,165 +38,624 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    #[command(about = "Install the microsandbox runtime and prepare the store and builder")]
-    Install,
-    #[command(about = "(Re)create the box for this checkout or forest")]
-    Start,
-    #[command(about = "Stop the box for this checkout or forest")]
-    Stop,
-    #[command(about = "Open a shell in the box for this checkout or forest")]
-    Enter,
-    #[command(about = "Run claude in the box for this checkout or forest")]
+    /// Make a box and boot it once
+    Create {
+        name: String,
+        /// Per-box env, for the box's life
+        #[arg(short = 'e', value_name = "K=V")]
+        env: Vec<String>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Boot a stopped box (a running one: warn about what waits for its next boot)
+    Start {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop, then start: applies pending ports and a changed config
+    Restart {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Stop a box (its processes get SIGHUP, then SIGKILL after 5 s)
+    Stop { name: String },
+    /// Remove a box, its data disk and its state
+    Rm {
+        name: String,
+        /// Also for broken states; a missing box is fine
+        #[arg(long)]
+        force: bool,
+    },
+    /// Run a command in a box (argv, no shell)
+    Exec {
+        name: String,
+        /// Fail with 122 instead of booting a stopped box
+        #[arg(long)]
+        no_start: bool,
+        /// Forward stdin
+        #[arg(short = 'i')]
+        interactive: bool,
+        /// A pty (needs a terminal)
+        #[arg(short = 't')]
+        tty: bool,
+        /// Working dir (absolute; default /workspace)
+        #[arg(short = 'w', value_name = "DIR")]
+        workdir: Option<String>,
+        #[arg(short = 'e', value_name = "K=V")]
+        env: Vec<String>,
+        #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
+        command: Vec<String>,
+    },
+    /// bash in a box
+    Enter {
+        name: String,
+        #[arg(long)]
+        no_start: bool,
+        #[arg(short = 'w', value_name = "DIR")]
+        workdir: Option<String>,
+    },
+    /// Copy a file or dir into or out of a box (`<name>:<path>` is the box side)
+    Cp { src: String, dest: String },
+    /// List this instance's boxes
+    Ls {
+        #[arg(long)]
+        json: bool,
+    },
+    /// A box's declared ports and where the host reaches them
+    Ports {
+        name: String,
+        #[arg(long)]
+        json: bool,
+    },
+    /// `exec <name> -i -t -- claude …`
     Claude {
+        name: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    #[command(about = "Run opencode in the box for this checkout or forest")]
+    /// `exec <name> -i -t -- opencode …`
     Opencode {
+        name: String,
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
     },
-    #[command(about = "Open a shell in the builder (owner of the shared nix store)")]
+    /// Prepare the store and the builder (operator command)
+    Install,
+    /// A shell in the builder, or `restart` it (operator command)
     Builder {
         #[command(subcommand)]
         action: Option<BuilderAction>,
     },
-    #[command(about = "Remove the box for this checkout or forest and its state")]
-    Rm,
-    #[command(
-        about = "List the builder and the boxes with their status, disk use and checkout or forest"
-    )]
-    Ls,
-    #[command(about = "Remove the boxes whose checkout or forest is gone, and their state")]
-    Prune,
 }
 
 #[derive(Debug, Subcommand)]
 enum BuilderAction {
-    #[command(about = "Recreate the builder (cuts off nix builds in progress)")]
+    /// Recreate the builder (cuts off nix builds in progress)
     Restart,
+    /// Remove the builder (the store stays; the next boot recreates it)
+    Rm,
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
-    match run(Cli::parse().command).await {
+fn main() -> ExitCode {
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e) => {
+            use clap::error::ErrorKind;
+            let code = match e.kind() {
+                ErrorKind::DisplayHelp | ErrorKind::DisplayVersion => 0,
+                _ => fail::USAGE,
+            };
+            let _ = e.print();
+            return ExitCode::from(code);
+        }
+    };
+    let instance = match setup_instance() {
+        Ok(i) => i,
+        Err(e) => {
+            eprintln!("bento: {e:#}");
+            return ExitCode::from(fail::OTHER);
+        }
+    };
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("bento: {e}");
+            return ExitCode::from(fail::OTHER);
+        }
+    };
+    match rt.block_on(run(&instance, cli.command)) {
         Ok(code) => ExitCode::from(code),
         Err(err) => {
-            eprintln!("error: {err:#}");
-            ExitCode::FAILURE
+            eprintln!("bento: {err:#}");
+            ExitCode::from(fail::code_of(&err))
         }
     }
 }
 
-async fn run(command: Command) -> Result<u8> {
-    let config = microsandbox::config::GlobalConfig::default();
-    // The nix package on Linux brings its own patched runtime via MSB_PATH,
-    // which sandboxes honor but `is_runtime_installed` doesn't look at.
-    let packaged_runtime = std::env::var_os("MSB_PATH").is_some();
-    if let Command::Install = command {
-        if !packaged_runtime {
-            println!("installing the microsandbox runtime...");
-            setup::install_runtime(
-                &config,
-                setup::InstallOptions {
-                    force: true, // replaces an older runtime on upgrade
-                    ..Default::default()
-                },
-            )
-            .await?;
-        }
-        check_host()?;
-        builder::ensure().await?;
-        println!("bento: ready");
-        return Ok(0);
-    }
-    if !packaged_runtime && !setup::is_runtime_installed(&config) {
-        bail!("the microsandbox runtime is not installed; run `bento install` first");
-    }
+/// Resolve the instance and point msb at its home, before any thread starts
+/// and before the SDK is touched: an inherited MSB_HOME is replaced, so a
+/// dev instance never reaches another instance's boxes.
+fn setup_instance() -> Result<Instance> {
+    let instance = Instance::resolve(
+        std::env::var_os("BENTO_HOME").as_deref(),
+        std::env::var_os("HOME").as_deref(),
+    )?;
+    instance.check_msb_home()?;
+    std::fs::create_dir_all(instance.msb_home())
+        .with_context(|| format!("creating {}", instance.msb_home().display()))?;
+    // SAFETY: single-threaded here (the runtime starts after this)
+    std::env::set_var("MSB_HOME", instance.msb_home());
+    Ok(instance)
+}
+
+fn print_json(v: &impl serde::Serialize) -> Result<()> {
+    println!("{}", serde_json::to_string(v)?);
+    Ok(())
+}
+
+async fn run(instance: &Instance, command: Command) -> Result<u8> {
     match command {
-        Command::Install => unreachable!(),
-        Command::Builder { action: None } => {
-            need_tty("bento builder")?;
-            builder::enter().await
+        Command::Create { name, env, json } => {
+            names::check_box(&name)?;
+            let env = env
+                .iter()
+                .map(|e| names::parse_env_arg(e))
+                .collect::<Result<Vec<_>>>()?;
+            let st = boxes::create(instance, &name, env).await?;
+            box_out(instance, &st, json).await
         }
-        Command::Builder {
-            action: Some(BuilderAction::Restart),
+        Command::Start { name, json } => {
+            let st = boxes::start(instance, &name).await?;
+            box_out(instance, &st, json).await
+        }
+        Command::Restart { name, json } => {
+            let st = boxes::restart(instance, &name).await?;
+            box_out(instance, &st, json).await
+        }
+        Command::Stop { name } => {
+            let _ = boxes::config_lenient(instance);
+            boxes::stop(instance, &name).await?;
+            Ok(0)
+        }
+        Command::Rm { name, force } => {
+            boxes::rm(instance, &name, force).await?;
+            Ok(0)
+        }
+        Command::Exec {
+            name,
+            no_start,
+            interactive,
+            tty,
+            workdir,
+            env,
+            command,
         } => {
-            builder::restart().await?;
+            let opts = ExecArgs {
+                no_start,
+                stdin: interactive,
+                tty,
+                workdir,
+                env,
+            };
+            exec_cmd(instance, &name, opts, command).await
+        }
+        Command::Enter {
+            name,
+            no_start,
+            workdir,
+        } => {
+            let opts = ExecArgs {
+                no_start,
+                stdin: true,
+                tty: true,
+                workdir,
+                env: vec![],
+            };
+            exec_cmd(instance, &name, opts, vec!["bash".into()]).await
+        }
+        Command::Claude { name, args } => agent(instance, &name, "claude", args).await,
+        Command::Opencode { name, args } => agent(instance, &name, "opencode", args).await,
+        Command::Cp { src, dest } => {
+            cp_cmd(instance, &src, &dest).await?;
             Ok(0)
         }
-        Command::Start => {
-            sandbox::create(&forest::discover()?).await?;
+        Command::Ls { json } => {
+            let boxes = boxes::ls(instance).await?;
+            if json {
+                print_json(&serde_json::json!({ "boxes": boxes }))?;
+            } else if boxes.is_empty() {
+                println!("no boxes");
+            } else {
+                let w = boxes.iter().map(|b| b.name.len()).max().unwrap_or(4).max(4);
+                println!("{:w$}  {:8}  CONFIG", "NAME", "STATE");
+                for b in boxes {
+                    let changed = if b.config_changed { "changed" } else { "" };
+                    println!("{:w$}  {:8}  {changed}", b.name, b.state);
+                }
+            }
+            if !json {
+                if let Some(config) = boxes::config_lenient(instance) {
+                    if let Some(status) = builder::Builder::new(instance, &config).status().await? {
+                        eprintln!("builder: {status}");
+                    }
+                }
+            }
             Ok(0)
         }
-        Command::Stop => {
-            sandbox::stop(&forest::discover()?).await?;
+        Command::Ports { name, json } => {
+            let report = boxes::ports(instance, &name).await?;
+            if json {
+                print_json(&report)?;
+            } else {
+                for p in &report.ports {
+                    let state = serde_json::to_value(p.state)?;
+                    println!(
+                        "{:>5}  {:9}  {}",
+                        p.guest,
+                        state.as_str().unwrap_or(""),
+                        p.address.as_deref().unwrap_or("-")
+                    );
+                }
+            }
             Ok(0)
         }
-        Command::Rm => {
-            sandbox::rm(&forest::discover()?).await?;
+        Command::Install => {
+            check_host()?;
+            let config = boxes::config_strict(instance)?;
+            let b = builder::Builder::new(instance, &config);
+            let nix = b.ensure().await?;
+            b.ensure_tools(&config, &nix).await?;
+            eprintln!("bento: ready");
             Ok(0)
         }
-        Command::Ls => {
-            sandbox::ls().await?;
-            Ok(0)
+        Command::Builder { action } => {
+            let config = boxes::config_strict(instance)?;
+            let b = builder::Builder::new(instance, &config);
+            match action {
+                None => {
+                    need_tty("bento builder")?;
+                    b.enter().await
+                }
+                Some(BuilderAction::Restart) => {
+                    b.restart().await?;
+                    Ok(0)
+                }
+                Some(BuilderAction::Rm) => {
+                    b.remove().await?;
+                    Ok(0)
+                }
+            }
         }
-        Command::Prune => {
-            sandbox::prune().await?;
-            Ok(0)
-        }
-        Command::Enter => {
-            need_tty("bento enter")?;
-            let forest = forest::discover()?;
-            let sb = sandbox::ensure_running(&forest).await?;
-            println!("entering box '{}' (detach with Ctrl-])", forest.name);
-            util::attach(&sb, "bash", &[], &forest.cwd, util::term_env()).await
-        }
-        Command::Claude { args } => run_agent(Agent::Claude, &args).await,
-        Command::Opencode { args } => run_agent(Agent::Opencode, &args).await,
     }
 }
 
-async fn run_agent(agent: Agent, args: &[String]) -> Result<u8> {
-    need_tty(&format!("bento {}", agent.command()))?;
-    let forest = forest::discover()?;
-    // fail on a missing token before creating anything
-    let mut env = agent.env(&util::home()?)?;
-    let sb = sandbox::ensure_running(&forest).await?;
-    if let Agent::Opencode = agent {
-        let state = sandbox::state_dir(&forest)?;
-        if let Err(e) = agent::import_opencode_credentials(&sb, &util::home()?, &state).await {
-            eprintln!("bento: importing opencode credentials: {e:#}");
-        }
+async fn box_out(instance: &Instance, st: &state::BoxState, json: bool) -> Result<u8> {
+    let config = config::load(instance).ok();
+    let rec = boxes::record(instance, st, config.as_ref()).await?;
+    if json {
+        print_json(&rec)?;
+    } else {
+        eprintln!("bento: box '{}': {}", rec.name, rec.state);
     }
-    env.extend(util::term_env());
-    util::attach(
-        &sb,
-        agent.command(),
-        &agent.launch_args(args),
-        &forest.cwd,
-        env,
-    )
-    .await
+    Ok(0)
 }
 
-/// Fail on what stops VMs from booting (on Linux: no /dev/kvm or no access to
-/// it) with msb's own hints, rather than on the first sandbox.
+fn need_tty(what: &str) -> Result<()> {
+    if !std::io::stdin().is_terminal() {
+        return Err(fail::usage(format!("`{what}` needs a terminal")));
+    }
+    Ok(())
+}
+
 fn check_host() -> Result<()> {
-    let problems: Vec<String> = setup::diagnose()
+    let problems: Vec<String> = microsandbox::setup::diagnose()
         .problems
         .iter()
         .map(|p| format!("{}\n  {}", p.headline, p.hints.join("\n  ")))
         .collect();
     if !problems.is_empty() {
-        bail!("this host can't run boxes:\n{}", problems.join("\n"));
+        anyhow::bail!("this host can't run boxes:\n{}", problems.join("\n"));
     }
     Ok(())
 }
 
-fn need_tty(what: &str) -> Result<()> {
-    if !std::io::stdin().is_terminal() {
-        bail!("stdin is not a terminal; `{what}` needs an interactive terminal");
+struct ExecArgs {
+    no_start: bool,
+    stdin: bool,
+    tty: bool,
+    workdir: Option<String>,
+    env: Vec<String>,
+}
+
+/// The env of a caller's command: bento's own and the global env as of the
+/// box's boot, its env_files read now, the box's `create -e`, then `-e`.
+fn command_env(
+    st: &state::BoxState,
+    extra: &[(String, String)],
+    tty: bool,
+) -> Result<Vec<(String, String)>> {
+    let boot = st
+        .boot
+        .as_ref()
+        .ok_or_else(|| fail::fail(fail::OTHER, "the box has never booted"))?;
+    let mut files = vec![];
+    for (name, path) in &boot.env_files {
+        let mut v = std::fs::read_to_string(path).map_err(|e| {
+            fail::fail(
+                fail::OTHER,
+                format!(
+                    "env_files.{name}: {}: {e}; the command didn't run",
+                    path.display()
+                ),
+            )
+        })?;
+        if v.ends_with('\n') {
+            v.pop();
+            if v.ends_with('\r') {
+                v.pop();
+            }
+        }
+        files.push((name.clone(), v));
+    }
+    let term = if tty {
+        vec![(
+            "TERM".to_string(),
+            std::env::var("TERM").unwrap_or_else(|_| "xterm-256color".into()),
+        )]
+    } else {
+        vec![]
+    };
+    Ok(guest::merge_env(&[
+        &term, &boot.env, &files, &st.env, extra,
+    ]))
+}
+
+async fn exec_cmd(instance: &Instance, name: &str, a: ExecArgs, argv: Vec<String>) -> Result<u8> {
+    names::check_box(name)?;
+    let extra = a
+        .env
+        .iter()
+        .map(|e| names::parse_env_arg(e))
+        .collect::<Result<Vec<_>>>()?;
+    let cwd = a.workdir.unwrap_or_else(|| guest::WORKSPACE.to_string());
+    if !cwd.starts_with('/') {
+        return Err(fail::usage(format!("-w {cwd}: must be absolute")));
+    }
+    if a.tty {
+        need_tty("bento exec -t")?;
+    }
+    if argv.is_empty() {
+        return Err(fail::usage("no command"));
+    }
+    let (sb, st, _config) = boxes::ensure_running(instance, name, a.no_start).await?;
+    let env = command_env(&st, &extra, a.tty)?;
+    exec::run(
+        &sb,
+        exec::Command {
+            argv,
+            cwd,
+            env,
+            stdin: a.stdin,
+            tty: a.tty,
+        },
+    )
+    .await
+}
+
+async fn agent(instance: &Instance, name: &str, agent: &str, args: Vec<String>) -> Result<u8> {
+    let tty = std::io::stdin().is_terminal();
+    let mut argv = vec![agent.to_string()];
+    argv.extend(args);
+    let opts = ExecArgs {
+        no_start: false,
+        stdin: true,
+        tty,
+        workdir: None,
+        env: vec![],
+    };
+    exec_cmd(instance, name, opts, argv).await
+}
+
+async fn cp_cmd(instance: &Instance, src: &str, dest: &str) -> Result<()> {
+    use cp::Operand;
+    match (cp::parse_operand(src), cp::parse_operand(dest)) {
+        (Operand::Host(host), Operand::Box { name, path }) => {
+            copy_in(instance, &host, src, &name, &path).await
+        }
+        (Operand::Box { name, path }, Operand::Host(host)) => {
+            copy_out(instance, &name, &path, &host, dest).await
+        }
+        _ => Err(fail::usage(
+            "cp: exactly one side must be a box path (<name>:<path>)",
+        )),
+    }
+}
+
+fn check_guest_path(p: &str) -> Result<()> {
+    if !p.starts_with('/') {
+        return Err(fail::usage(format!("cp: box paths are absolute: {p}")));
     }
     Ok(())
+}
+
+async fn guest_kind(
+    sb: &microsandbox::sandbox::Sandbox,
+    env: &[(String, String)],
+    path: &str,
+) -> Result<cp::Kind> {
+    let out = exec::script(sb, guest::STAT, &[path], env)
+        .await?
+        .check("cp")?;
+    cp::parse_kind(&String::from_utf8_lossy(&out.stdout))
+}
+
+async fn copy_in(
+    instance: &Instance,
+    host: &std::path::Path,
+    src_arg: &str,
+    name: &str,
+    guest_dest: &str,
+) -> Result<()> {
+    names::check_box(name)?;
+    check_guest_path(guest_dest)?;
+    let kind = cp::host_kind(host);
+    if matches!(kind, cp::Kind::Missing | cp::Kind::NoParent) {
+        return Err(fail::fail(
+            fail::OTHER,
+            format!("{}: no such file or directory", host.display()),
+        ));
+    }
+    let (sb, st, _) = boxes::ensure_running(instance, name, false).await?;
+    let env = command_env(&st, &[], false)?;
+    let dest_kind = guest_kind(&sb, &env, guest_dest).await?;
+    let place = cp::place(src_arg, kind, guest_dest, dest_kind)?;
+    let host = host.to_path_buf();
+    let top = place.name.clone();
+    exec::script_with_input(&sb, guest::EXTRACT, &[&place.dir], &env, move |w| {
+        cp::write_archive(&host, top.as_deref(), w)
+    })
+    .await?
+    .check("cp")
+    .map_err(|e| fail::fail(fail::OTHER, format!("{e:#}")))?;
+    Ok(())
+}
+
+async fn copy_out(
+    instance: &Instance,
+    name: &str,
+    guest_src: &str,
+    host: &std::path::Path,
+    dest_arg: &str,
+) -> Result<()> {
+    names::check_box(name)?;
+    check_guest_path(guest_src)?;
+    let (sb, st, _) = boxes::ensure_running(instance, name, false).await?;
+    let env = command_env(&st, &[], false)?;
+    let src_kind = guest_kind(&sb, &env, guest_src).await?;
+    let place = cp::place(guest_src, src_kind, dest_arg, cp::host_kind(host))?;
+    let (adir, aname) = cp::archive_root(guest_src);
+    let dest_dir = PathBuf::from(&place.dir);
+    let top = aname.clone();
+    let (code, err) =
+        exec::script_with_output(&sb, guest::ARCHIVE, &[&adir, &aname], &env, move |r| {
+            cp::unpack(r, &top, &dest_dir, place.name.as_deref())
+        })
+        .await?;
+    if code != 0 {
+        return Err(fail::fail(
+            fail::OTHER,
+            format!("cp: {}", String::from_utf8_lossy(&err).trim()),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_parses_the_contract() {
+        let p = |args: &[&str]| {
+            Cli::try_parse_from(std::iter::once("bento").chain(args.iter().copied()))
+        };
+        let c = p(&[
+            "exec",
+            "b",
+            "--no-start",
+            "-i",
+            "-w",
+            "/x",
+            "-e",
+            "A=1",
+            "--",
+            "sh",
+            "-c",
+            "echo -e",
+        ])
+        .unwrap();
+        match c.command {
+            Command::Exec {
+                name,
+                no_start,
+                interactive,
+                tty,
+                workdir,
+                env,
+                command,
+            } => {
+                assert_eq!(name, "b");
+                assert!(no_start && interactive && !tty);
+                assert_eq!(workdir.as_deref(), Some("/x"));
+                assert_eq!(env, ["A=1"]);
+                assert_eq!(command, ["sh", "-c", "echo -e"]);
+            }
+            _ => panic!(),
+        }
+        // flags after the command belong to the command
+        match p(&["exec", "b", "ls", "-i", "-w"]).unwrap().command {
+            Command::Exec {
+                interactive,
+                command,
+                ..
+            } => {
+                assert!(!interactive);
+                assert_eq!(command, ["ls", "-i", "-w"]);
+            }
+            _ => panic!(),
+        }
+        assert!(p(&["exec", "b"]).is_err());
+        assert!(p(&["create", "b", "-e", "A=1", "-e", "B=2", "--json"]).is_ok());
+        assert!(p(&["rm", "b", "--force"]).is_ok());
+        assert!(p(&["restart", "b", "--json"]).is_ok());
+        assert!(p(&["cp", "a:/x", "./y"]).is_ok());
+        match p(&["claude", "b", "--resume", "-p", "x"]).unwrap().command {
+            Command::Claude { args, .. } => assert_eq!(args, ["--resume", "-p", "x"]),
+            _ => panic!(),
+        }
+        let v = p(&["--version"]).unwrap_err();
+        assert_eq!(v.kind(), clap::error::ErrorKind::DisplayVersion);
+        assert!(v.to_string().contains("(contract 2)"));
+    }
+
+    #[test]
+    fn command_env_order_and_env_files() {
+        let d = std::env::temp_dir().join(format!("bento-env-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("tok"), "secret\n").unwrap();
+        let st = state::BoxState {
+            name: "b".into(),
+            msb_name: "bento-b".into(),
+            ip: std::net::Ipv4Addr::new(127, 77, 0, 1),
+            env: vec![("A".into(), "box".into()), ("B".into(), "box".into())],
+            phase: state::Phase::Ready,
+            boot: Some(state::Boot {
+                config_hash: "h".into(),
+                env: vec![
+                    ("PATH".into(), "/p".into()),
+                    ("A".into(), "global".into()),
+                    ("G".into(), "g".into()),
+                ],
+                env_files: vec![("TOK".into(), d.join("tok"))],
+            }),
+            ports: Default::default(),
+        };
+        let env = command_env(&st, &[("B".into(), "exec".into())], false).unwrap();
+        let get = |k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str());
+        assert_eq!(get("A"), Some("box"));
+        assert_eq!(get("B"), Some("exec"));
+        assert_eq!(get("G"), Some("g"));
+        assert_eq!(get("TOK"), Some("secret"));
+        assert_eq!(get("PATH"), Some("/p"));
+        assert_eq!(get("TERM"), None);
+        std::fs::remove_file(d.join("tok")).unwrap();
+        let err = command_env(&st, &[], false).unwrap_err();
+        assert_eq!(fail::code_of(&err), fail::OTHER);
+        let _ = std::fs::remove_dir_all(&d);
+    }
 }

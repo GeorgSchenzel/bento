@@ -17,24 +17,36 @@
       packages = nixpkgs.lib.genAttrs systems (
         system:
         let
-          pkgs = import nixpkgs {
-            inherit system;
-            config.allowUnfree = true; # claude-code
-          };
+          pkgs = import nixpkgs { inherit system; };
+          # every `bento exec` runs its command through this (bento-run.c)
+          bento-run = pkgs.runCommandCC "bento-run" { } ''
+            mkdir -p $out/bin
+            $CC -O2 -Wall -o $out/bin/bento-run ${./bento-run.c}
+          '';
         in
         {
           default = pkgs.buildEnv {
             name = "bento-tools";
+            # agents and other extra tools come from the config's `tools`
             paths = with pkgs; [
-              claude-code
-              opencode
-              devenv # boxes run in the checkout's devenv shell
+              bento-run
+              bashInteractive # bento's scripts and `enter`
+              coreutils
+              findutils
+              gnugrep
+              gnused
+              gnutar # cp and copy
+              gzip
+              procps
+              util-linux # mount, findmnt, setsid for the boot script
+              cacert # git and nix over https
+              devenv
               docker # dockerd runs in every box; includes compose and buildx
               git
-              just # the agents' guide points at justfiles
-              python3 # agents shell out to python3
-              uv # python projects and tools
-              socat
+              just
+              python3
+              uv
+              socat # channel shims and nix forwarding
               ncurses # terminfo for the host's TERM
             ];
           };

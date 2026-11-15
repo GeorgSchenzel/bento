@@ -1,5 +1,5 @@
 {
-  description = "bento — per-checkout microsandbox boxes on a shared nix store";
+  description = "bento: local VM sandboxes for agents, on microsandbox and a shared nix store";
 
   inputs = {
     # Used to build the bento package.
@@ -33,9 +33,8 @@
       ...
     }:
     let
-      # microsandbox needs Apple Silicon on macOS
+      # Linux for now; macOS (Apple Silicon) is for later
       packageSystems = [
-        "aarch64-darwin"
         "x86_64-linux"
         "aarch64-linux"
       ];
