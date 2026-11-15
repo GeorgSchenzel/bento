@@ -60,7 +60,7 @@ json_get() { python3 -c "import json,sys; d=json.load(sys.stdin); print(eval(sys
 live_snapshot() {
   {
     ls -la --time-style=+%s "$HOME/.microsandbox" "$HOME/.microsandbox/sandboxes" \
-      "$HOME/.local/share/bento" 2>/dev/null
+      "$HOME/.local/share/bento" 2>/dev/null | grep -v ' \.\.$' # `..` is $HOME, ~/.local/share: anything touches them
     for p in /proc/[0-9]*; do
       local c
       c=$(tr '\0' ' ' <"$p/cmdline" 2>/dev/null) || continue
