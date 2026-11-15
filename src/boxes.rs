@@ -714,10 +714,15 @@ pub async fn rm(instance: &Instance, name: &str, force: bool) -> Result<()> {
     let st = state::load(instance, name);
     let st = match (st, force) {
         (Ok(Some(st)), _) => Some(st),
-        (Ok(None), _) if !force && !instance.box_dir(name).exists() => {
-            return Err(fail::no_box(name))
+        (Ok(None), false) if !instance.box_dir(name).exists() => return Err(fail::no_box(name)),
+        // a dir without its record is a broken state: removes nothing (contract)
+        (Ok(None), false) => {
+            return Err(fail(
+                fail::OTHER,
+                format!("box '{name}' has no record; `bento rm --force {name}` removes it anyway"),
+            ))
         }
-        (Ok(None), _) => None,
+        (Ok(None), true) => None,
         (Err(e), false) => {
             return Err(fail(
                 fail::OTHER,
@@ -909,6 +914,26 @@ mod tests {
         let (free, busy) = probe_ports(ip, &BTreeSet::from([busy_port, free_port]));
         assert_eq!(busy, BTreeSet::from([busy_port]));
         assert_eq!(free, BTreeSet::from([free_port]));
+    }
+
+    #[test]
+    fn rm_refuses_a_dir_without_its_record() {
+        let d = std::env::temp_dir().join(format!("bento-rm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let inst = Instance::resolve(Some(d.join("bh").as_os_str()), Some(d.as_os_str())).unwrap();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let code = |r: Result<()>| r.err().map(|e| fail::code_of(&e));
+        assert_eq!(code(rt.block_on(rm(&inst, "x", false))), Some(fail::NO_BOX));
+        std::fs::create_dir_all(inst.box_dir("x")).unwrap();
+        std::fs::write(inst.box_dir("x").join("data.img"), "disk").unwrap();
+        assert_eq!(code(rt.block_on(rm(&inst, "x", false))), Some(fail::OTHER));
+        assert!(
+            inst.box_dir("x").join("data.img").exists(),
+            "nothing removed"
+        );
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     #[test]
