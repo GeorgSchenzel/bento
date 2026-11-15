@@ -38,6 +38,11 @@ substituters = https://cache.nixos.org
 trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY=
 ";
 
+/// Without a sandbox, nix refuses every build while the fake HOME exists, and
+/// a build that writes to $HOME leaves it behind. Removed before each tool build
+/// (START runs in a fresh builder, which has none).
+const CLEAN_HOME: &str = "rm -rf /homeless-shelter";
+
 const START: &str = r#"set -eu
 if [ "$(cat /nix/var/bento/tools.hash 2>/dev/null)" != "__HASH__" ] || [ ! -e __TOOLS__ ]; then
   echo "builder: building box tools (first run downloads ~1 GB)..." >&2
@@ -215,16 +220,7 @@ impl<'a> Builder<'a> {
             .context("connecting to the builder")?;
         for (name, flake) in todo {
             eprintln!("bento: builder: building tool {name} ({flake})");
-            let root = format!("{EXTRA}/{name}");
-            let script = format!(
-                "set -eu\nmkdir -p {EXTRA} /nix/var/bento/extra\n\
-                 NIXPKGS_ALLOW_UNFREE=1 nix build --impure --print-build-logs {} --out-link {}\n\
-                 printf %s {} > /nix/var/bento/extra/{name}.ref\n",
-                util::sh_quote(flake),
-                util::sh_quote(&root),
-                util::sh_quote(flake),
-            );
-            util::run_streamed(&sb, &format!("building tool {name}"), script)
+            util::run_streamed(&sb, &format!("building tool {name}"), tool_script(name, flake))
                 .await
                 .map_err(|e| crate::fail::fail(crate::fail::OTHER, format!("{e:#}")))?;
         }
@@ -241,6 +237,17 @@ impl<'a> Builder<'a> {
             .context("attaching to the builder")?;
         Ok(if code < 0 { 0 } else { code as u8 })
     }
+}
+
+fn tool_script(name: &str, flake: &str) -> String {
+    format!(
+        "set -eu\nmkdir -p {EXTRA} /nix/var/bento/extra\n{CLEAN_HOME}\n\
+         NIXPKGS_ALLOW_UNFREE=1 nix build --impure --print-build-logs {} --out-link {}\n\
+         printf %s {} > /nix/var/bento/extra/{name}.ref\n",
+        util::sh_quote(flake),
+        util::sh_quote(&format!("{EXTRA}/{name}")),
+        util::sh_quote(flake),
+    )
 }
 
 /// Built from the same ref, and its GC root still points into the store.
@@ -280,6 +287,13 @@ mod tests {
     fn spec_follows_the_port_and_the_tools() {
         assert_ne!(spec(17760), spec(17761));
         assert_eq!(spec(17760), spec(17760));
+    }
+
+    #[test]
+    fn builds_remove_the_fake_home_first() {
+        let script = tool_script("claude", "github:a/b#c");
+        let clean = script.find(CLEAN_HOME).expect(&script);
+        assert!(clean < script.find("nix build").unwrap(), "{script}");
     }
 
     #[test]
