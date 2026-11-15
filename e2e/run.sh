@@ -279,6 +279,9 @@ if [ "${E2E_AGENTS:-}" = 1 ]; then
   # unprompted: without the permission settings the shell command is denied
   bx p0-a -- timeout 300 claude -p "Use the Bash tool to run exactly this command: touch /workspace/claude-ran . Then reply done." >"$H/claude.out" 2>&1
   check "claude runs a shell command without a permission prompt" bx p0-a -- test -e /workspace/claude-ran
+  # a fresh HOME has no models cache: the first run looks the model up in the
+  # bundled snapshot (older than models.dev) and fails on a newer model
+  bx p0-a -- timeout 120 opencode models --refresh >/dev/null 2>&1
   bx p0-a -- timeout 300 opencode run "Use your bash tool to run exactly this command: touch /workspace/opencode-ran . Then reply done." >"$H/opencode.out" 2>&1
   check "opencode runs a shell command without a permission prompt" bx p0-a -- test -e /workspace/opencode-ran
 else
