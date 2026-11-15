@@ -255,7 +255,10 @@ fn tool_current(nix: &Path, name: &str, flake: &str) -> bool {
     let rel = |p: &str| nix.join(p.trim_start_matches("/nix/"));
     let built = std::fs::read_to_string(rel(&format!("/nix/var/bento/extra/{name}.ref")));
     let root = rel(&format!("{EXTRA}/{name}"));
-    let target_ok = std::fs::read_link(&root).is_ok_and(|t| {
+    // msb keeps the builder's symlinks as regular files holding the target.
+    let target = std::fs::read_link(&root)
+        .or_else(|_| std::fs::read_to_string(&root).map(PathBuf::from));
+    let target_ok = target.is_ok_and(|t| {
         t.strip_prefix("/nix/")
             .is_ok_and(|inside| nix.join(inside).exists())
     });
@@ -314,6 +317,11 @@ mod tests {
         .unwrap();
         assert!(tool_current(&nix, "claude", "github:a/b#c"));
         assert!(!tool_current(&nix, "claude", "github:a/b/new#c"));
+        // As the host sees the builder's symlink under msb.
+        let root = nix.join("var/nix/gcroots/bento/extra/claude");
+        std::fs::remove_file(&root).unwrap();
+        std::fs::write(&root, "/nix/store/abc-claude").unwrap();
+        assert!(tool_current(&nix, "claude", "github:a/b#c"));
         std::fs::remove_dir_all(nix.join("store/abc-claude")).unwrap();
         assert!(!tool_current(&nix, "claude", "github:a/b#c")); // collected
         let _ = std::fs::remove_dir_all(&d);
