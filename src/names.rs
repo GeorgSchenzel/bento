@@ -102,6 +102,32 @@ pub fn parse_env_arg(arg: &str) -> anyhow::Result<(String, String)> {
     Ok((k.to_string(), v.to_string()))
 }
 
+/// Parse an `exec`/`enter` `-e`: `K=V`, or `K` alone (Docker's convention),
+/// which takes K's value from `caller` (the caller's environment); K unset
+/// there: None, the variable isn't set by this layer. Errors about a `K`
+/// alone name only K, never its value.
+pub fn parse_exec_env_arg(
+    arg: &str,
+    caller: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> anyhow::Result<Option<(String, String)>> {
+    if arg.contains('=') {
+        return parse_env_arg(arg).map(Some);
+    }
+    if !is_env_name(arg) {
+        return Err(fail::usage(format!("-e '{arg}': not an env name")));
+    }
+    if is_reserved_env(arg) {
+        return Err(fail::usage(format!("-e {arg}: {arg} is set by bento")));
+    }
+    match caller(arg) {
+        None => Ok(None),
+        Some(v) => match v.into_string() {
+            Ok(v) => Ok(Some((arg.to_string(), v))),
+            Err(_) => Err(fail::usage(format!("-e {arg}: its value isn't UTF-8"))),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -178,6 +204,37 @@ mod tests {
             "NIX_REMOTE=x",
         ] {
             assert_eq!(code_of(&parse_env_arg(bad).unwrap_err()), USAGE, "{bad}");
+        }
+    }
+
+    #[test]
+    fn exec_env_args_from_the_caller() {
+        use std::ffi::OsString;
+        let caller = |k: &str| match k {
+            "TOK" | "PATH" | "1A" => Some(OsString::from("s3cret-value")),
+            _ => None,
+        };
+        let p = |a: &str| parse_exec_env_arg(a, caller);
+        assert_eq!(
+            p("TOK").unwrap(),
+            Some(("TOK".to_string(), "s3cret-value".to_string()))
+        );
+        assert_eq!(p("UNSET").unwrap(), None, "unset in the caller: not set");
+        assert_eq!(p("A=b").unwrap(), Some(("A".to_string(), "b".to_string())));
+        for bad in ["PATH", "BENTO_X", "1A", "A-B", ""] {
+            let err = p(bad).unwrap_err();
+            assert_eq!(code_of(&err), USAGE, "{bad}");
+            assert!(
+                !format!("{err:#}").contains("s3cret"),
+                "{bad}: value in the error"
+            );
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt as _;
+            let err = parse_exec_env_arg("TOK", |_| Some(OsString::from_vec(vec![0xff, b's'])))
+                .unwrap_err();
+            assert_eq!(code_of(&err), USAGE);
         }
     }
 }

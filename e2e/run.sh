@@ -253,6 +253,10 @@ expect_code "-e of bento's own name is 120" 120 bx p0-a -e HOME=/ -- true
 check "global env" test "$(out_of p0-a -- printenv E2E_ENV)" = one
 check "env_files, trailing newline dropped" test "$(out_of p0-a -- printenv E2E_SECRET)" = secret-1
 check "-e wins" test "$(out_of p0-a -e E2E_ENV=two -- printenv E2E_ENV)" = two
+check "-e NAME: the caller's value, over env_files" \
+  test "$(E2E_SECRET=from-caller out_of p0-a -e E2E_SECRET -- printenv E2E_SECRET)" = from-caller
+check "-e NAME unset in the caller: the global value stays" \
+  test "$(unset E2E_ENV; out_of p0-a -e E2E_ENV -- printenv E2E_ENV)" = one
 check "HOME is the host's" test "$(out_of p0-a -- printenv HOME)" = "$HOME"
 mv "$H/secret" "$H/secret.away"
 expect_code "an unreadable env_files file is 125" 125 bx p0-a -- true

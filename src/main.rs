@@ -83,7 +83,8 @@ enum Command {
         /// Working dir (absolute; default /workspace)
         #[arg(short = 'w', value_name = "DIR")]
         workdir: Option<String>,
-        #[arg(short = 'e', value_name = "K=V")]
+        /// K=V, or K alone: K's value from this environment (unset: not set)
+        #[arg(short = 'e', value_name = "K[=V]")]
         env: Vec<String>,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
@@ -95,6 +96,9 @@ enum Command {
         no_start: bool,
         #[arg(short = 'w', value_name = "DIR")]
         workdir: Option<String>,
+        /// K=V, or K alone: K's value from this environment (unset: not set)
+        #[arg(short = 'e', value_name = "K[=V]")]
+        env: Vec<String>,
     },
     /// Copy a file or dir into or out of a box (`<name>:<path>` is the box side)
     Cp { src: String, dest: String },
@@ -248,13 +252,14 @@ async fn run(instance: &Instance, command: Command) -> Result<u8> {
             name,
             no_start,
             workdir,
+            env,
         } => {
             let opts = ExecArgs {
                 no_start,
                 stdin: true,
                 tty: true,
                 workdir,
-                env: vec![],
+                env,
             };
             exec_cmd(instance, &name, opts, vec!["bash".into()]).await
         }
@@ -372,8 +377,25 @@ struct ExecArgs {
     env: Vec<String>,
 }
 
+/// The token the agent shortcuts pass through from the caller's environment
+/// (by name, as `-e`: the value never goes into an argument).
+const AGENT_TOKEN_ENV: &str = "CLAUDE_CODE_OAUTH_TOKEN";
+
+/// `exec`/`enter` `-e`s, each `K=V` or `K` from the caller's environment.
+fn exec_env(
+    env: &[String],
+    caller: impl Fn(&str) -> Option<std::ffi::OsString> + Copy,
+) -> Result<Vec<(String, String)>> {
+    let mut out = vec![];
+    for e in env {
+        out.extend(names::parse_exec_env_arg(e, caller)?);
+    }
+    Ok(out)
+}
+
 /// The env of a caller's command: bento's own and the global env as of the
 /// box's boot, its env_files read now, the box's `create -e`, then `-e`.
+/// An env_files entry that `-e` overrides isn't read.
 fn command_env(
     st: &state::BoxState,
     extra: &[(String, String)],
@@ -385,6 +407,9 @@ fn command_env(
         .ok_or_else(|| fail::fail(fail::OTHER, "the box has never booted"))?;
     let mut files = vec![];
     for (name, path) in &boot.env_files {
+        if extra.iter().any(|(k, _)| k == name) {
+            continue;
+        }
         let mut v = std::fs::read_to_string(path).map_err(|e| {
             fail::fail(
                 fail::OTHER,
@@ -417,11 +442,7 @@ fn command_env(
 
 async fn exec_cmd(instance: &Instance, name: &str, a: ExecArgs, argv: Vec<String>) -> Result<u8> {
     names::check_box(name)?;
-    let extra = a
-        .env
-        .iter()
-        .map(|e| names::parse_env_arg(e))
-        .collect::<Result<Vec<_>>>()?;
+    let extra = exec_env(&a.env, |k| std::env::var_os(k))?;
     let cwd = a.workdir.unwrap_or_else(|| guest::WORKSPACE.to_string());
     if !cwd.starts_with('/') {
         return Err(fail::usage(format!("-w {cwd}: must be absolute")));
@@ -448,7 +469,12 @@ async fn exec_cmd(instance: &Instance, name: &str, a: ExecArgs, argv: Vec<String
 }
 
 async fn agent(instance: &Instance, name: &str, agent: &str, args: Vec<String>) -> Result<u8> {
-    let tty = std::io::stdin().is_terminal();
+    let (opts, argv) = agent_exec(agent, args, std::io::stdin().is_terminal());
+    exec_cmd(instance, name, opts, argv).await
+}
+
+/// `bento claude|opencode`: `exec -i [-t] -e CLAUDE_CODE_OAUTH_TOKEN -- <agent> …`.
+fn agent_exec(agent: &str, args: Vec<String>, tty: bool) -> (ExecArgs, Vec<String>) {
     let mut argv = vec![agent.to_string()];
     argv.extend(args);
     let opts = ExecArgs {
@@ -456,9 +482,9 @@ async fn agent(instance: &Instance, name: &str, agent: &str, args: Vec<String>) 
         stdin: true,
         tty,
         workdir: None,
-        env: vec![],
+        env: vec![AGENT_TOKEN_ENV.to_string()],
     };
-    exec_cmd(instance, name, opts, argv).await
+    (opts, argv)
 }
 
 async fn cp_cmd(instance: &Instance, src: &str, dest: &str) -> Result<()> {
@@ -653,9 +679,56 @@ mod tests {
         assert_eq!(get("TOK"), Some("secret"));
         assert_eq!(get("PATH"), Some("/p"));
         assert_eq!(get("TERM"), None);
+        // -e TOK (from the caller) wins over env_files.TOK
+        let env = command_env(&st, &[("TOK".into(), "caller".into())], false).unwrap();
+        let tok: Vec<_> = env.iter().filter(|(n, _)| n == "TOK").collect();
+        assert_eq!(tok, [&("TOK".to_string(), "caller".to_string())]);
         std::fs::remove_file(d.join("tok")).unwrap();
         let err = command_env(&st, &[], false).unwrap_err();
         assert_eq!(fail::code_of(&err), fail::OTHER);
+        // an overridden env_files file isn't read: its absence doesn't matter
+        assert!(command_env(&st, &[("TOK".into(), "caller".into())], false).is_ok());
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn exec_env_from_the_caller() {
+        use std::ffi::OsString;
+        let caller = |k: &str| (k == "TOK").then(|| OsString::from("s3cret-value"));
+        let env = exec_env(&["A=1".into(), "TOK".into(), "UNSET".into()], caller).unwrap();
+        assert_eq!(
+            env,
+            [
+                ("A".to_string(), "1".to_string()),
+                ("TOK".to_string(), "s3cret-value".to_string())
+            ]
+        );
+        let err = exec_env(&["TOK".into(), "HOME".into()], caller).unwrap_err();
+        assert_eq!(fail::code_of(&err), fail::USAGE);
+        assert!(!format!("{err:#}").contains("s3cret"));
+        // `enter` takes -e too
+        let c = Cli::try_parse_from(["bento", "enter", "b", "-e", "TOK", "-e", "A=1"]).unwrap();
+        match c.command {
+            Command::Enter { env, .. } => assert_eq!(env, ["TOK", "A=1"]),
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn agent_shortcuts_pass_the_token_by_name() {
+        let (opts, argv) = agent_exec("claude", vec!["-p".into(), "hi".into()], false);
+        assert_eq!(argv, ["claude", "-p", "hi"]);
+        assert_eq!(opts.env, [AGENT_TOKEN_ENV]);
+        assert!(opts.stdin && !opts.tty);
+        // the value reaches only the env, never argv
+        let caller = |k: &str| (k == AGENT_TOKEN_ENV).then(|| "s3cret-value".into());
+        let env = exec_env(&opts.env, caller).unwrap();
+        assert_eq!(
+            env,
+            [(AGENT_TOKEN_ENV.to_string(), "s3cret-value".to_string())]
+        );
+        assert!(!argv.iter().any(|a| a.contains("s3cret")));
+        // unset in the caller: not set, the box's own (agents.claude.tokenFile) applies
+        assert!(exec_env(&opts.env, |_| None).unwrap().is_empty());
     }
 }
