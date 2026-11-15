@@ -334,6 +334,7 @@ check "... and published after the restart" sh -c "'$B' ports p0-a --json | grep
 check "... with the data disk intact" test "$(out_of p0-a -- cat /workspace/w)" = w
 
 section "cp"
+rm -rf "$H/out1" "$H/out2" "$H/c.txt" # a previous run's copies: cp into an existing dir nests
 expect_code "cp a dir in" 0 bento cp "$H/cpdir" p0-a:/workspace/
 check "... lands as /workspace/cpdir" test "$(out_of p0-a -- cat /workspace/cpdir/sub/b)" = B
 expect_code "cp a dir out to a new path" 0 bento cp p0-a:/workspace/cpdir "$H/out1"
