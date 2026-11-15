@@ -215,10 +215,15 @@ rofile() {{
             name = ch.name
         ));
     }
+    // /run and /var/run are plain rootfs dirs (msb mounts no tmpfs; /run
+    // holds msb's own files), so dockerd's pidfile and socket in /var/run
+    // outlive a stop: on the next boot the stale pid belongs to another
+    // process and dockerd refuses to start. A tmpfs on /var/run (docker's
+    // only) starts it empty at every boot.
     s.push_str(&format!(
         r#"rm -f {NIX_SOCK}
 setsid -f socat UNIX-LISTEN:{NIX_SOCK},fork TCP:host.microsandbox.internal:{port} </dev/null >"$S/nix-fwd.log" 2>&1
-rm -f /var/run/docker.sock
+ismnt /var/run || mount -t tmpfs -o mode=755 tmpfs /var/run
 setsid -f dockerd --data-root {DOCKER_ROOT} </dev/null >"$S/dockerd.log" 2>&1
 "#,
         port = c.instance.nix_port
@@ -389,6 +394,9 @@ git: {github.com: /t1, gitlab.com: /t2}
         assert!(s.contains("-b 32768"));
         assert!(s.contains("dockerd --data-root /var/lib/docker"));
         assert!(s.contains("docker info"));
+        // dockerd's pidfile never outlives a boot: a fresh /var/run first
+        let run = s.find("mount -t tmpfs -o mode=755 tmpfs /var/run").unwrap();
+        assert!(run < s.find("setsid -f dockerd").unwrap());
         // binds happen before files (which may lie in HOME) and before services
         let home = s.find("bindto /bento/data/home '/home/u'").unwrap();
         let files = s.find("rofile /bento/files/0").unwrap();

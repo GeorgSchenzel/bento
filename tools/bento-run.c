@@ -14,7 +14,9 @@
  *   - signals bento forwards (INT, TERM, HUP, QUIT, USR1, USR2) go on to
  *     the command's group;
  *   - the exit status is the command's, 128+n when signal n killed it,
- *     127 / 126 when it can't be found / run.
+ *     127 / 126 when it can't be found / run;
+ *   - it changes to the command's dir itself (its first argument; msb
+ *     spawns it in `/`), so a missing `-w` dir is 125, not msb's 127.
  *
  * Processes the command leaves behind keep running (until `bento stop`).
  */
@@ -86,10 +88,15 @@ static void watch(int rfd, pid_t pgid) {
 }
 
 int main(int argc, char **argv) {
-    if (argc < 2) {
-        fprintf(stderr, "usage: bento-run <command> [args...]\n");
+    if (argc < 3) {
+        fprintf(stderr, "usage: bento-run <dir> <command> [args...]\n");
         return 125;
     }
+    if (chdir(argv[1]) < 0) {
+        fprintf(stderr, "bento: %s: no such dir (%s)\n", argv[1], strerror(errno));
+        return 125;
+    }
+    argv++;
     int tty = isatty(0) && tcgetpgrp(0) == getpgrp();
     int pipefd[2];
     if (pipe2(pipefd, O_CLOEXEC) < 0) {

@@ -240,16 +240,18 @@ pub fn failed_code(kind: ExecFailureKind) -> u8 {
 
 /// Run a caller's command through bento-run; returns its exit code.
 pub async fn run(sb: &Sandbox, cmd: Command) -> Result<u8> {
-    let mut argv = cmd.argv.clone();
+    // bento-run changes to the dir itself: msb would fail the spawn with
+    // ENOENT (127) for a missing one, and the contract says 125
+    let mut argv = vec![cmd.cwd.clone()];
+    argv.extend(cmd.argv.iter().cloned());
     let env = cmd.env.clone();
-    let cwd = cmd.cwd.clone();
     let (stdin, tty) = (cmd.stdin, cmd.tty);
     let mut handle = sb
         .exec_stream_with(RUN, move |o| {
             let o = o
                 .args(std::mem::take(&mut argv))
                 .envs(env)
-                .cwd(cwd)
+                .cwd("/")
                 .tty(tty);
             if stdin {
                 o.stdin_pipe()
@@ -259,15 +261,7 @@ pub async fn run(sb: &Sandbox, cmd: Command) -> Result<u8> {
         })
         .await
         .map_err(|e| match e {
-            MicrosandboxError::ExecFailed(f) => {
-                let code = failed_code(f.kind);
-                let what = if matches!(f.kind, ExecFailureKind::BadCwd) {
-                    format!("{}: no such dir", cmd.cwd)
-                } else {
-                    f.message.clone()
-                };
-                fail::fail(code, what)
-            }
+            MicrosandboxError::ExecFailed(f) => fail::fail(failed_code(f.kind), f.message.clone()),
             e => anyhow::Error::from(e).context("running the command"),
         })?;
     let control = handle.control();
