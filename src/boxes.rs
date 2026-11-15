@@ -489,7 +489,9 @@ async fn set_ports(h: &SandboxHandle, ip: Ipv4Addr, publish: &BTreeSet<u16>) -> 
         return Ok(());
     }
     let mut m = h.modify().next_start();
-    for c in &current {
+    // msb refuses a port that is both set and removed: remove only the
+    // ones no longer wanted (setting a kept one replaces it)
+    for c in stale_ports(&current, &want) {
         m = m.remove_port(microsandbox::sandbox::PublishedPortKey {
             host_bind: c.host_bind.clone(),
             host_port: c.host_port,
@@ -501,6 +503,22 @@ async fn set_ports(h: &SandboxHandle, ip: Ipv4Addr, publish: &BTreeSet<u16>) -> 
     }
     m.apply().await.context("setting the box's ports")?;
     Ok(())
+}
+
+/// The published ports in `current` that `want` doesn't keep (same host
+/// address, port and protocol).
+fn stale_ports<'a>(
+    current: &'a [microsandbox_types::PublishedPortSpec],
+    want: &[microsandbox_types::PublishedPortSpec],
+) -> Vec<&'a microsandbox_types::PublishedPortSpec> {
+    current
+        .iter()
+        .filter(|c| {
+            !want.iter().any(|w| {
+                w.host_bind == c.host_bind && w.host_port == c.host_port && w.protocol == c.protocol
+            })
+        })
+        .collect()
 }
 
 /// The host's git identity, if it has one.
@@ -847,6 +865,20 @@ mod tests {
         ensure_disk(&disk, 64).unwrap();
         assert_eq!(std::fs::read(&disk).unwrap(), b"workspace");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn only_dropped_ports_are_removed() {
+        let port = |p: u16| microsandbox_types::PublishedPortSpec {
+            host_port: p,
+            guest_port: p,
+            host_bind: "127.78.0.1".into(),
+            ..Default::default()
+        };
+        let current = [port(5173), port(8080)];
+        let want = [port(5173), port(9000)];
+        let stale: Vec<u16> = stale_ports(&current, &want).iter().map(|p| p.host_port).collect();
+        assert_eq!(stale, vec![8080]);
     }
 
     #[test]

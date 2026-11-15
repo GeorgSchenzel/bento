@@ -264,7 +264,8 @@ check "after stop/start: the rootfs stays" test "$(out_of p0-a -- cat /etc/rootf
 check "copy: re-copied at boot" test "$(out_of p0-a -- cat /etc/e2e-copy)" = copy-2
 
 write_config "  E2E_ENV2: x"
-check "a changed config shows as config_changed" sh -c "'$B' ls --json | grep -q '\"name\":\"p0-a\",\"state\":\"running\",\"config_changed\":true'"
+ls_of() { "$B" ls --json | json_get "[(b['state'], b['config_changed']) for b in d['boxes'] if b['name']=='$1']"; }
+check "a changed config shows as config_changed" test "$(ls_of p0-a)" = "[('running', True)]"
 check "start on a running box warns about the config" sh -c "'$B' start p0-a 2>&1 | grep -q 'config changed'"
 expect_code "restart recreates" 0 bento restart p0-a
 check "after a recreate: workspace, HOME, hc's state, docker" \
@@ -274,7 +275,7 @@ id1
 1"
 expect_code "after a recreate: the rootfs is reset" 1 bx p0-a -- test -e /etc/rootfs-marker
 check "after a recreate: the new env" test "$(out_of p0-a -- printenv E2E_ENV2)" = x
-check "config_changed is false again" sh -c "'$B' ls --json | grep -q '\"name\":\"p0-a\",\"state\":\"running\",\"config_changed\":false'"
+check "config_changed is false again" test "$(ls_of p0-a)" = "[('running', False)]"
 
 section "enter, stop under a command"
 bento stop p0-a >/dev/null 2>&1
