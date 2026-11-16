@@ -1,8 +1,9 @@
 # programs.bento on home-manager: the bento CLI, its global config
 # (~/.config/bento/config.yaml, contracts.md) and agent presets. The presets
 # are this module's, not bento's: each expands into plain config keys (the
-# agent as a tool, its settings with permission prompts off, the host's agent
-# config read-only, its credentials).
+# agent as a tool, its settings generated here with permission prompts off, its
+# credentials from secret files at each exec). Nothing of the host's own agent
+# config goes in: two hosts with the same nix config make the same boxes.
 self: systems:
 {
   config,
@@ -32,23 +33,38 @@ let
   # claude's first-run onboarding, skipped (auth comes from the token)
   claudeState = json.generate "bento-claude.json" { hasCompletedOnboarding = true; };
 
-  opencodeBox = json.generate "bento-opencode.json" {
-    "$schema" = "https://opencode.ai/config.json";
-    permission = {
-      edit = "allow";
-      bash = "allow";
-      webfetch = "allow";
-    };
-  };
+  # `zai-coding-plan` → `ZAI_CODING_PLAN`, for env names
+  envName = n: lib.toUpper (lib.replaceStrings [ "-" "." ] [ "_" "_" ] n);
+  claudeTokenVar = n: "CLAUDE_ACCOUNT_${envName n}_TOKEN";
+  opencodeKeyVar = n: "OPENCODE_KEY_${envName n}";
 
-  hostEntries =
-    dir: names:
-    map (n: {
-      guest = "~/${dir}/${n}";
-      host = "~/${dir}/${n}";
-    }) names;
+  # the person's settings, then the box's: keys from the env, no permission prompts
+  opencodeBox = json.generate "bento-opencode.json" (
+    lib.recursiveUpdate (removeAttrs opencode.settings [ "permission" ]) {
+      "$schema" = "https://opencode.ai/config.json";
+      permission."*" = "allow";
+      provider = lib.mapAttrs (n: _: {
+        options.apiKey = "{env:${opencodeKeyVar n}}";
+      }) opencode.apiKeyFiles;
+    }
+  );
 in
 {
+  imports = [
+    (lib.mkRemovedOptionModule [ "programs" "bento" "agents" "claude" "tokenFile" ]
+      "Use programs.bento.agents.claude.accounts.<name> = <token file>."
+    )
+    (lib.mkRemovedOptionModule [ "programs" "bento" "agents" "claude" "hostConfig" ]
+      "Boxes get no host agent config; set claude's model with agents.claude.model."
+    )
+    (lib.mkRemovedOptionModule [ "programs" "bento" "agents" "opencode" "authFile" ]
+      "opencode 2.x ignores a copied auth.json; use agents.opencode.apiKeyFiles.<provider> = <key file>."
+    )
+    (lib.mkRemovedOptionModule [ "programs" "bento" "agents" "opencode" "hostConfig" ]
+      "Boxes get no host agent config; use agents.opencode.settings (e.g. config.programs.opencode.settings)."
+    )
+  ];
+
   options.programs.bento = {
     enable = lib.mkEnableOption "bento";
 
@@ -96,27 +112,38 @@ in
         default = "${nixpkgsRef}#claude-code";
         description = "Flake ref of claude, built by the builder.";
       };
-      tokenFile = lib.mkOption {
-        type = lib.types.str;
-        example = "~/.config/sops-nix/secrets/bento/claude-token";
+      accounts = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        example = lib.literalExpression ''
+          {
+            main = config.sops.secrets."bento/claude-token".path;
+            second = config.sops.secrets."bento/claude-token-2".path;
+          }
+        '';
         description = ''
-          Path of a file holding a `claude setup-token` token, set as
-          CLAUDE_CODE_OAUTH_TOKEN in every exec (read on the host at each exec;
-          only the path goes into the config). No default: an unreadable file
-          fails every exec, enter and cp (125, contracts.md), so set it to where
-          the token really is.
+          claude accounts by name: the path of a file holding each one's
+          `claude setup-token` token (read on the host at each exec; only the
+          path goes into the config; an unreadable one fails every exec, enter
+          and cp, 125). Every exec gets each as CLAUDE_ACCOUNT_<NAME>_TOKEN, and
+          the default one as CLAUDE_CODE_OAUTH_TOKEN: a launcher picks another
+          by setting CLAUDE_CODE_OAUTH_TOKEN from its variable (stew's
+          `--account`).
         '';
       };
-      hostConfig = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [
-          "settings.json"
-          "plugins"
-        ];
+      defaultAccount = lib.mkOption {
+        type = lib.types.str;
+        default = if claude.accounts == { } then "" else lib.head (lib.attrNames claude.accounts);
+        defaultText = "the first account by name";
+        description = "The account claude uses unless a launcher picks another.";
+      };
+      model = lib.mkOption {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        example = "opus";
         description = ''
-          Entries of the host's ~/.claude the boxes get read-only. Each must
-          exist (a missing one fails the boot). Not `skills` by default: stew's
-          module mounts its own there.
+          claude's model in boxes (ANTHROPIC_MODEL; `/model` still changes it
+          for a session). With a token alone claude doesn't know the account's
+          plan and starts on its plain default, so set it.
         '';
       };
     };
@@ -127,15 +154,28 @@ in
         type = lib.types.str;
         default = "${nixpkgsRef}#opencode";
       };
-      authFile = lib.mkOption {
-        type = lib.types.str;
-        default = "~/.local/share/opencode/auth.json";
-        description = "Copied into every box at each boot (opencode rewrites it).";
+      apiKeyFiles = lib.mkOption {
+        type = lib.types.attrsOf lib.types.str;
+        default = { };
+        example = lib.literalExpression ''
+          { zai-coding-plan = config.sops.secrets.zai-api-key.path; }
+        '';
+        description = ''
+          A file holding the API key per opencode provider id. Every exec gets
+          each as OPENCODE_KEY_<ID>, and the box's opencode.json sets
+          `provider.<id>.options.apiKey` to it: nothing is stored in the box
+          (opencode 2.x keeps logins in its database and reads auth.json only
+          once, so a copied auth.json logs nothing in).
+        '';
       };
-      hostConfig = lib.mkOption {
-        type = lib.types.listOf lib.types.str;
-        default = [ "opencode.json" ];
-        description = "Entries of the host's ~/.config/opencode the boxes get read-only.";
+      settings = lib.mkOption {
+        type = json.type;
+        default = { };
+        example = lib.literalExpression "config.programs.opencode.settings";
+        description = ''
+          opencode.json for boxes (model, providers, ...). Its `permission` is
+          replaced: boxes allow everything.
+        '';
       };
     };
   };
@@ -147,6 +187,10 @@ in
           {
             assertion = supported;
             message = "bento is only packaged for ${lib.concatStringsSep ", " systems}.";
+          }
+          {
+            assertion = !claude.enable || claude.accounts ? ${claude.defaultAccount};
+            message = "programs.bento.agents.claude: defaultAccount must name one of accounts (set at least one).";
           }
         ];
         home.packages = lib.mkIf supported [ cfg.package ];
@@ -161,8 +205,7 @@ in
               guest = "/etc/claude-code/managed-settings.json";
               host = "${claudeManaged}";
             }
-          ]
-          ++ hostEntries ".claude" claude.hostConfig;
+          ];
           copy = [
             {
               guest = "~/.claude/.claude.json";
@@ -174,8 +217,14 @@ in
             # the "trust this folder" prompt, which the permission mode doesn't cover
             CLAUDE_CODE_SANDBOXED = "1";
             CLAUDE_CODE_NO_FLICKER = "1";
-          };
-          env_files.CLAUDE_CODE_OAUTH_TOKEN = claude.tokenFile;
+          }
+          // lib.optionalAttrs (claude.model != null) { ANTHROPIC_MODEL = claude.model; };
+          # (no default account is an assertion, not an eval error here)
+          env_files =
+            lib.optionalAttrs (claude.accounts ? ${claude.defaultAccount}) {
+              CLAUDE_CODE_OAUTH_TOKEN = claude.accounts.${claude.defaultAccount};
+            }
+            // lib.mapAttrs' (n: f: lib.nameValuePair (claudeTokenVar n) f) claude.accounts;
         };
       })
       (lib.mkIf opencode.enable {
@@ -186,15 +235,9 @@ in
               guest = "/etc/opencode-bento/opencode.json";
               host = "${opencodeBox}";
             }
-          ]
-          ++ hostEntries ".config/opencode" opencode.hostConfig;
-          copy = [
-            {
-              guest = "~/.local/share/opencode/auth.json";
-              host = opencode.authFile;
-            }
           ];
           env.OPENCODE_CONFIG = "/etc/opencode-bento/opencode.json";
+          env_files = lib.mapAttrs' (n: f: lib.nameValuePair (opencodeKeyVar n) f) opencode.apiKeyFiles;
         };
       })
     ]

@@ -728,7 +728,7 @@ mod tests {
             [(AGENT_TOKEN_ENV.to_string(), "s3cret-value".to_string())]
         );
         assert!(!argv.iter().any(|a| a.contains("s3cret")));
-        // unset in the caller: not set, the box's own (agents.claude.tokenFile) applies
+        // unset in the caller: not set, the box's own (the default claude account's) applies
         assert!(exec_env(&opts.env, |_| None).unwrap().is_empty());
     }
 }

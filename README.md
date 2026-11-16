@@ -76,12 +76,23 @@ programs.bento = {
   # token files by path only (e.g. sops-nix's); a missing one is a warning
   git."github.com" = "~/.config/sops-nix/secrets/git/github-com";
   agents.claude = {
-    enable = true;                # tool, managed settings, ~/.claude config ro, token
-    tokenFile = "~/.config/sops-nix/secrets/bento/claude-token";
+    enable = true;                # tool, managed settings, a token per account
+    accounts.main = "~/.config/sops-nix/secrets/bento/claude-token";
+    model = "opus";               # a token alone doesn't tell claude the plan
   };
-  agents.opencode.enable = true;  # tool, permissions, auth.json copied in
+  agents.opencode = {
+    enable = true;                # tool, generated opencode.json, keys from files
+    apiKeyFiles.zai-coding-plan = "~/.config/sops-nix/secrets/zai-api-key";
+    settings.model = "zai-coding-plan/glm-5.3";
+  };
 };
 ```
+
+Nothing of the host's own agent config is mounted or copied: boxes are made from
+this config alone. Every exec gets each claude account's token as
+`CLAUDE_ACCOUNT_<NAME>_TOKEN` (the default one as `CLAUDE_CODE_OAUTH_TOKEN`) and each
+opencode key as `OPENCODE_KEY_<ID>`, read from their files on the host at that
+exec.
 
 Unknown keys fail commands that may boot (125) and are warnings elsewhere.
 
